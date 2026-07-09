@@ -1,0 +1,4 @@
+flask
+ecdsa
+requests
+py_ecc
