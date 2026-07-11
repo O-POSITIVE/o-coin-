@@ -14,11 +14,27 @@ Run it:
 """
 import argparse
 import functools
+import os
 import time
+
+# Local network security software on this machine intercepts TLS with a
+# cert that's in the OS trust store but not Python's bundled CA list — same
+# root cause/fix as trading-platform's server.py. This script always runs
+# locally (never deployed), so no Render-specific gating needed here.
+import truststore
+truststore.inject_into_ssl()
 
 import requests
 
 from pow_hash import header_fields_to_hash
+
+# Only needed against a node that has OCOIN_NODE_SHARED_SECRET set (the
+# real deployed node does) — read from the environment so this stays
+# secret-free source, not hardcoded. Set it in your shell before running:
+#   PowerShell:  $env:OCOIN_NODE_SHARED_SECRET = "..."
+#   cmd:         set OCOIN_NODE_SHARED_SECRET=...
+NODE_SHARED_SECRET = os.environ.get("OCOIN_NODE_SHARED_SECRET", "")
+_HEADERS = {"X-Node-Auth": NODE_SHARED_SECRET} if NODE_SHARED_SECRET else {}
 
 # Python fully buffers stdout when it's not a live terminal (piped to a
 # log file, redirected, etc.) — without this, every print() below sits in
@@ -39,18 +55,20 @@ def header_hash(template, nonce):
 
 
 def fetch_template(node, address):
-    r = requests.get(f"{node}/mining/template", params={"miner_address": address}, timeout=10)
+    r = requests.get(f"{node}/mining/template", params={"miner_address": address}, headers=_HEADERS, timeout=30)
     r.raise_for_status()
     return r.json()
 
 
 def submit_block(node, template, nonce):
     body = {**template, "nonce": nonce}
-    r = requests.post(f"{node}/mining/submit", json=body, timeout=10)
+    r = requests.post(f"{node}/mining/submit", json=body, headers=_HEADERS, timeout=30)
     return r.status_code, r.json()
 
 
 def mine(node, address):
+    if not NODE_SHARED_SECRET and node != "http://localhost:5100" and "127.0.0.1" not in node:
+        print("Warning: OCOIN_NODE_SHARED_SECRET isn't set in this terminal — a remote node with that env var configured will reject every request with 401.")
     print(f"O-Coin miner starting — node {node}, rewards to {address}")
     while True:
         template = fetch_template(node, address)

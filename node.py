@@ -41,10 +41,17 @@ import time
 import psycopg2
 import psycopg2.extras
 import requests
+from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
 from blockchain import Block, Blockchain
 from transaction import Transaction
+
+# Loads DATABASE_URL/OCOIN_NODE_SHARED_SECRET from a local .env file when
+# running `python node.py` directly (e.g. Start Mining.bat) — same
+# convention trading-platform's server.py uses. On Render, real env vars are
+# already set directly and this is a harmless no-op (no .env file deployed).
+load_dotenv()
 
 app = Flask(__name__)
 chain_lock = threading.Lock()  # guards every mutation below — a node is a single shared blockchain instance, and mining/tx-submission/sync/gossip can all race against each other without this
