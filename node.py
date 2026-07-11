@@ -34,10 +34,12 @@ Run it:
 """
 import argparse
 import json
-import sqlite3
+import os
 import threading
 import time
 
+import psycopg2
+import psycopg2.extras
 import requests
 from flask import Flask, jsonify, request
 
@@ -49,7 +51,34 @@ chain_lock = threading.Lock()  # guards every mutation below — a node is a sin
 blockchain = Blockchain()
 peers = set()  # other nodes' base URLs, e.g. "http://localhost:5101" — registered by hand for now, see README's roadmap for real peer discovery
 
-DB_FILE = None  # set from --port in __main__; see save_block()/load_chain() below
+# ── Persistence: Supabase Postgres, not local SQLite ────────────────────────
+# A local chain_data_<port>.db file gets silently wiped on any host with an
+# ephemeral filesystem (confirmed the hard way once already in this account,
+# via trading-platform's candle-storage bug — same root cause, same fix).
+# Reuses the exact DATABASE_URL/connect_timeout pattern trading-platform's
+# server.py already uses in production, and keeps the file-based design's
+# "one table per port" trick so two local nodes started for sync-testing
+# still get independent chains instead of silently sharing rows.
+DATABASE_URL = os.getenv("DATABASE_URL")
+BLOCKS_TABLE = None  # set from --port in __main__; see init_db()/save_block()/load_chain() below
+
+# ── Shared-secret gate ───────────────────────────────────────────────────────
+# This node has no other auth/rate-limiting (see README's roadmap). In
+# production it should only ever be called by trading-platform's server.py,
+# proxying already-authenticated/rate-limited requests — this header is what
+# actually enforces that "only Flask calls this" in practice, not just in
+# intent. Optional (only enforced if the env var is set) so local dev/testing
+# is unaffected.
+NODE_SHARED_SECRET = os.getenv("OCOIN_NODE_SHARED_SECRET")
+PUBLIC_PATHS = {"/status"}  # left open for an external keep-alive pinger; no sensitive data
+
+
+@app.before_request
+def _require_shared_secret():
+    if not NODE_SHARED_SECRET or request.path in PUBLIC_PATHS:
+        return None
+    if request.headers.get("X-Node-Auth") != NODE_SHARED_SECRET:
+        return jsonify({"status": "failed", "reason": "Unauthorized"}), 401
 
 # ── Mining pool state ───────────────────────────────────────────────────
 # Shares are credited to `pool_pending_shares` as they come in during the
@@ -66,49 +95,76 @@ pool_pending_shares = {}  # {address: share_count} — accumulating now, becomes
 POOL_SHARE_TARGET_MULTIPLIER = 8  # a share is valid work at 1/8th the real network difficulty
 
 
+def get_pg():
+    # connect_timeout matters: psycopg2 has no default connect timeout at
+    # all, so a hung TCP-connect (a network blip between this node's host
+    # and Supabase) blocks the calling thread forever instead of raising —
+    # see trading-platform's server.py get_pg() / the candle-sync hang
+    # incident this same fix already resolved once.
+    return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+
+
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("CREATE TABLE IF NOT EXISTS blocks (idx INTEGER PRIMARY KEY, data TEXT NOT NULL)")
-    conn.commit()
-    conn.close()
+    conn = get_pg()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"CREATE TABLE IF NOT EXISTS {BLOCKS_TABLE} (idx INTEGER PRIMARY KEY, data JSONB NOT NULL)")
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def save_block(block: Block):
     """One INSERT per block — O(1) regardless of chain length, unlike
     rewriting a single ever-growing JSON file on every block."""
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("INSERT OR REPLACE INTO blocks (idx, data) VALUES (?, ?)", (block.index, json.dumps(block.to_dict())))
-    conn.commit()
-    conn.close()
+    conn = get_pg()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"INSERT INTO {BLOCKS_TABLE} (idx, data) VALUES (%s, %s) "
+            "ON CONFLICT (idx) DO UPDATE SET data = EXCLUDED.data",
+            (block.index, psycopg2.extras.Json(block.to_dict())),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def save_full_chain():
     """Used only after a chain replacement (peer sync adopted a longer
     chain) — that's the one case where more than one block changes at
     once, so a bulk rewrite is actually the right tool, not the default."""
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("DELETE FROM blocks")
-    conn.executemany(
-        "INSERT INTO blocks (idx, data) VALUES (?, ?)",
-        [(b.index, json.dumps(b.to_dict())) for b in blockchain.chain],
-    )
-    conn.commit()
-    conn.close()
+    conn = get_pg()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"DELETE FROM {BLOCKS_TABLE}")
+        psycopg2.extras.execute_batch(
+            cur,
+            f"INSERT INTO {BLOCKS_TABLE} (idx, data) VALUES (%s, %s)",
+            [(b.index, psycopg2.extras.Json(b.to_dict())) for b in blockchain.chain],
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def load_chain():
     init_db()
-    conn = sqlite3.connect(DB_FILE)
-    # idx > 0: genesis is never written to the DB at all (Blockchain()
-    # always regenerates an identical one deterministically in __init__ —
-    # same index, same all-zero previous_hash, same fixed timestamp/nonce
-    # — so there's nothing to persist there). Only blocks 1+ are real
-    # history worth loading.
-    rows = conn.execute("SELECT data FROM blocks WHERE idx > 0 ORDER BY idx ASC").fetchall()
-    conn.close()
+    conn = get_pg()
+    try:
+        cur = conn.cursor()
+        # idx > 0: genesis is never written to the DB at all (Blockchain()
+        # always regenerates an identical one deterministically in __init__ —
+        # same index, same all-zero previous_hash, same fixed timestamp/nonce
+        # — so there's nothing to persist there). Only blocks 1+ are real
+        # history worth loading.
+        cur.execute(f"SELECT data FROM {BLOCKS_TABLE} WHERE idx > 0 ORDER BY idx ASC")
+        rows = cur.fetchall()
+    finally:
+        conn.close()
     if not rows:
         return
-    loaded_blocks = [Block.from_dict(json.loads(r[0])) for r in rows]
+    loaded_blocks = [Block.from_dict(r[0] if isinstance(r[0], dict) else json.loads(r[0])) for r in rows]
     candidate = [blockchain.chain[0]] + loaded_blocks
     if blockchain.is_chain_valid(candidate):
         blockchain.chain = candidate
@@ -123,9 +179,9 @@ def load_chain():
             blockchain.current_target = last_pow.target
         if last_pos is not None:
             blockchain.pos_target = last_pos.target
-        print(f"Loaded {len(candidate)} blocks from {DB_FILE}")
+        print(f"Loaded {len(candidate)} blocks from {BLOCKS_TABLE}")
     else:
-        print(f"WARNING: {DB_FILE} failed validation, starting from genesis instead")
+        print(f"WARNING: {BLOCKS_TABLE} failed validation, starting from genesis instead")
 
 
 def broadcast_block(block: Block):
@@ -501,16 +557,20 @@ def staking_loop(address):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=5100)
+    parser.add_argument("--host", default="0.0.0.0", help="Bind address — defaults to 0.0.0.0 (reachable off-machine), not Flask's own 127.0.0.1 default, since a cloud-hosted node must accept connections from outside its own container.")
     parser.add_argument("--stake", help="Address to stake with — starts a background PoS thread alongside the node (see staking_loop). Optional; a node with no --stake just never produces PoS blocks itself, but still validates and syncs ones it hears about from peers.")
     args = parser.parse_args()
-    # Deliberately NOT a fixed default filename — two nodes started in the
-    # same folder (exactly the "run a second node locally to test sync"
-    # scenario this whole peer-sync feature exists for) would otherwise
-    # silently share one database and appear to sync perfectly without
-    # ever actually talking to each other over HTTP at all.
-    DB_FILE = f"chain_data_{args.port}.db"
+    if not DATABASE_URL:
+        raise SystemExit("DATABASE_URL env var is required — the chain persists to Postgres now, not a local SQLite file (see get_pg()/init_db() above).")
+    # Deliberately NOT a fixed default table name — two nodes started
+    # against the same database for local sync-testing (exactly the "run a
+    # second node locally to test sync" scenario this whole peer-sync
+    # feature exists for) would otherwise silently share one chain and
+    # appear to sync perfectly without ever actually talking to each other
+    # over HTTP at all. Same trick the old per-port SQLite filename played.
+    BLOCKS_TABLE = f"ocoin_blocks_{args.port}"
     load_chain()
-    print(f"O-Coin node starting on port {args.port} — target block time {blockchain.TARGET_BLOCK_TIME}s, {len(blockchain.chain)} block(s) loaded, persisting to {DB_FILE}")
+    print(f"O-Coin node starting on {args.host}:{args.port} — target block time {blockchain.TARGET_BLOCK_TIME}s, {len(blockchain.chain)} block(s) loaded, persisting to Postgres table {BLOCKS_TABLE}")
     if args.stake:
         threading.Thread(target=staking_loop, args=(args.stake,), daemon=True).start()
-    app.run(port=args.port)
+    app.run(host=args.host, port=args.port)
