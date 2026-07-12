@@ -77,7 +77,16 @@ BLOCKS_TABLE = None  # set from --port in __main__; see init_db()/save_block()/l
 # intent. Optional (only enforced if the env var is set) so local dev/testing
 # is unaffected.
 NODE_SHARED_SECRET = os.getenv("OCOIN_NODE_SHARED_SECRET")
-PUBLIC_PATHS = {"/status"}  # left open for an external keep-alive pinger; no sensitive data
+# /status: left open for an external keep-alive pinger; no sensitive data.
+# /mining/template, /mining/submit: opened deliberately (2026-07-11) so
+# anyone running the public miner.py download can actually reach the
+# node directly, not just trading-platform's own server — this is the
+# intended "public mining" front door, not an oversight. Safe to open:
+# a submitted block still has to satisfy real proof-of-work and pass
+# full chain validation to be accepted, same as any other miner talking
+# to any other node on any real chain. Every other route (transactions,
+# pool payouts, peer/node management) stays behind the shared secret.
+PUBLIC_PATHS = {"/status", "/mining/template", "/mining/submit"}
 
 
 @app.before_request
