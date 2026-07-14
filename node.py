@@ -259,7 +259,11 @@ def new_transaction():
     required = ("sender", "recipient", "amount", "public_key", "signature")
     if not all(k in body for k in required):
         return jsonify({"status": "failed", "reason": f"Missing fields, need: {required}"}), 400
-    tx = Transaction(body["sender"], body["recipient"], body["amount"], body.get("fee"), body["public_key"], body["signature"], body.get("timestamp"))
+    tx = Transaction(
+        body["sender"], body["recipient"], body["amount"], body.get("fee"),
+        body["public_key"], body["signature"], body.get("timestamp"),
+        body.get("op"), body.get("op_data"),
+    )
     with chain_lock:
         try:
             tx_hash = blockchain.add_transaction(tx)
@@ -623,6 +627,16 @@ if __name__ == "__main__":
     # over HTTP at all. Same trick the old per-port SQLite filename played.
     BLOCKS_TABLE = f"ocoin_blocks_{args.port}"
     load_chain()
+    # Track A, Phase A6 — test-only override, completely inert unless
+    # someone deliberately sets this env var (Render's production
+    # environment never does). Lets a LOCAL test node exercise op-bearing
+    # transactions for real over HTTP without ever touching the actual
+    # committed TX_SCHEMA_ACTIVATION_HEIGHT constant that gates the real,
+    # deployed chain — see test_live_network.py.
+    test_activation_height = os.getenv("OCOIN_TEST_ACTIVATION_HEIGHT")
+    if test_activation_height is not None:
+        blockchain.TX_SCHEMA_ACTIVATION_HEIGHT = int(test_activation_height)
+        print(f"TEST OVERRIDE: TX_SCHEMA_ACTIVATION_HEIGHT set to {blockchain.TX_SCHEMA_ACTIVATION_HEIGHT} via OCOIN_TEST_ACTIVATION_HEIGHT")
     print(f"O-Coin node starting on {args.host}:{args.port} — target block time {blockchain.TARGET_BLOCK_TIME}s, {len(blockchain.chain)} block(s) loaded, persisting to Postgres table {BLOCKS_TABLE}")
     if args.stake:
         threading.Thread(target=staking_loop, args=(args.stake,), daemon=True).start()
