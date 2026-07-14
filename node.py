@@ -533,6 +533,32 @@ def stake_pool_status():
         return jsonify(blockchain.stake_pool_status())
 
 
+@app.route("/pools")
+def list_pools():
+    """Track A, Phase A5/A7 — every pool_key that currently has (or has
+    ever had) liquidity, for a client to then call /pools/<pool_key> on."""
+    with chain_lock:
+        return jsonify({"pools": blockchain.list_pools()})
+
+
+@app.route("/pools/<pool_key>")
+def amm_pool_status(pool_key):
+    """Track A, Phase A5/A7 — read-only AMM pool snapshot (reserves, LP
+    supply, spot price). pool_key is 'asset_a:asset_b' in canonical sorted
+    order, e.g. /pools/OCN:TEST — matches the same op_data.pool_key format
+    pool_add_liquidity/pool_swap/pool_remove_liquidity transactions use.
+    Named distinctly from pool_status() above (this chain's PRE-EXISTING
+    PoW MINING pool, /pool/status, singular — a completely unrelated
+    feature that predates Track A) to avoid a Flask endpoint-name
+    collision; the URL paths were already distinct (/pool/ vs /pools/),
+    only the Python function names needed disambiguating."""
+    with chain_lock:
+        try:
+            return jsonify(blockchain.pool_status(pool_key))
+        except ValueError as e:
+            return jsonify({"status": "failed", "reason": str(e)}), 400
+
+
 @app.route("/pos/stake")
 def stake_here():
     """Convenience endpoint mirroring /mine: one single kernel-check

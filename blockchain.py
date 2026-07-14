@@ -454,9 +454,22 @@ class Blockchain:
     # the real chain even if this code reaches it.
     TX_SCHEMA_ACTIVATION_HEIGHT = 1_000_000
 
-    # Recognized ops. A5's AMM pool ops get added to this set when that
-    # phase is actually built — never an open "anything goes" op namespace.
-    KNOWN_OPS = {"transfer_asset", "stake_pool_deposit", "stake_pool_withdraw"}
+    # Recognized ops — never an open "anything goes" op namespace.
+    KNOWN_OPS = {
+        "transfer_asset", "stake_pool_deposit", "stake_pool_withdraw",
+        "pool_add_liquidity", "pool_swap", "pool_remove_liquidity",
+    }
+
+    # AMM swap-fee cut, taken from the INPUT side of every swap (same
+    # convention Uniswap V2 uses) — a fixed integer ratio (997/1000 = 0.3%
+    # fee), never a float, so the exact same output is reproducible on
+    # every node regardless of platform, the same "no float in a
+    # consensus-relevant calculation" discipline as everywhere else in this
+    # file. The 0.3% fee accrues directly to the pool's reserves (nobody
+    # separately collects it) — it's what pays existing LPs for providing
+    # liquidity, same as every real constant-product AMM.
+    POOL_SWAP_FEE_NUMERATOR = 997
+    POOL_SWAP_FEE_DENOMINATOR = 1000
 
     # Protocol-recognized liquid-staking pool address (Track A, Phase A4) —
     # a plain SHA-256 hash, deterministic and identical on every node, that
@@ -477,6 +490,42 @@ class Blockchain:
     # server-held operator signing key would be required — there is no key
     # to protect, lose, or leak, because nothing here is keyed at all.
     STAKE_POOL_ADDRESS = hashlib.sha256(b"STAKE_POOL:OCN").hexdigest()[:40]
+
+    @staticmethod
+    def _pool_key(asset_a, asset_b):
+        """Canonical, order-independent identifier for an asset pair's AMM
+        pool — assets sorted so a pool for (OCN, TEST) and (TEST, OCN) are
+        the same pool, never two different ones by accident."""
+        a, b = sorted([asset_a, asset_b])
+        return f"{a}:{b}"
+
+    @staticmethod
+    def _pool_address(pool_key):
+        """Protocol-recognized AMM pool address (Track A, Phase A5) — same
+        keyless design as STAKE_POOL_ADDRESS above: a plain SHA-256 hash no
+        real keypair can ever match, so a pool can accumulate reserves with
+        no private key existing for it anywhere. Swap/liquidity credits are
+        protocol-computed (every node independently re-derives the same
+        constant-product math from the same prior reserves), never
+        separately signed — the same trust model this chain already
+        applies to mining/staking rewards, just extended to AMM pools."""
+        return hashlib.sha256(f"POOL:{pool_key}".encode()).hexdigest()[:40]
+
+    @staticmethod
+    def _lp_asset_id(pool_key):
+        return f"LP:{pool_key}"
+
+    @staticmethod
+    def _validate_pool_key(pool_key):
+        if not isinstance(pool_key, str) or pool_key.count(":") != 1:
+            raise ValueError("op_data.pool_key must be a string of the form 'asset_a:asset_b'")
+        asset_a, asset_b = pool_key.split(":")
+        if not asset_a or not asset_b:
+            raise ValueError("pool_key assets must both be non-empty")
+        if asset_a == asset_b:
+            raise ValueError("a pool cannot pair an asset with itself")
+        if [asset_a, asset_b] != sorted([asset_a, asset_b]):
+            raise ValueError(f"pool_key must be in canonical sorted order: '{Blockchain._pool_key(asset_a, asset_b)}'")
 
     @staticmethod
     def _asset_id_of(tx):
@@ -517,6 +566,40 @@ class Blockchain:
                 raise ValueError("stake_pool_withdraw redeems to the sender's own address — recipient must equal sender")
             if tx.amount <= 0:
                 raise ValueError("stake_pool_withdraw requires amount > 0 (the stOCN amount being redeemed)")
+        elif tx.op == "pool_add_liquidity":
+            pool_key = (tx.op_data or {}).get("pool_key")
+            Blockchain._validate_pool_key(pool_key)
+            if tx.recipient != Blockchain._pool_address(pool_key):
+                raise ValueError("pool_add_liquidity must send to the pool's own derived address")
+            amount_a = (tx.op_data or {}).get("amount_a")
+            amount_b = (tx.op_data or {}).get("amount_b")
+            if not isinstance(amount_a, (int, float)) or isinstance(amount_a, bool) or amount_a <= 0:
+                raise ValueError("pool_add_liquidity requires op_data.amount_a > 0")
+            if not isinstance(amount_b, (int, float)) or isinstance(amount_b, bool) or amount_b <= 0:
+                raise ValueError("pool_add_liquidity requires op_data.amount_b > 0")
+        elif tx.op == "pool_swap":
+            pool_key = (tx.op_data or {}).get("pool_key")
+            Blockchain._validate_pool_key(pool_key)
+            asset_a, asset_b = pool_key.split(":")
+            asset_in = (tx.op_data or {}).get("asset_in")
+            if asset_in not in (asset_a, asset_b):
+                raise ValueError(f"pool_swap op_data.asset_in must be one of the pool's two assets ({asset_a}, {asset_b})")
+            amount_in = (tx.op_data or {}).get("amount_in")
+            if not isinstance(amount_in, (int, float)) or isinstance(amount_in, bool) or amount_in <= 0:
+                raise ValueError("pool_swap requires op_data.amount_in > 0")
+            min_amount_out = (tx.op_data or {}).get("min_amount_out", 0)
+            if not isinstance(min_amount_out, (int, float)) or isinstance(min_amount_out, bool) or min_amount_out < 0:
+                raise ValueError("pool_swap op_data.min_amount_out must be a number >= 0")
+            if tx.recipient != tx.sender:
+                raise ValueError("pool_swap redeems to the sender's own address — recipient must equal sender")
+        elif tx.op == "pool_remove_liquidity":
+            pool_key = (tx.op_data or {}).get("pool_key")
+            Blockchain._validate_pool_key(pool_key)
+            lp_amount = (tx.op_data or {}).get("lp_amount")
+            if not isinstance(lp_amount, (int, float)) or isinstance(lp_amount, bool) or lp_amount <= 0:
+                raise ValueError("pool_remove_liquidity requires op_data.lp_amount > 0")
+            if tx.recipient != tx.sender:
+                raise ValueError("pool_remove_liquidity redeems to the sender's own address — recipient must equal sender")
 
     @staticmethod
     def _stake_pool_exchange_rate(balances, asset_supply):
@@ -544,6 +627,40 @@ class Blockchain:
             "exchange_rate": self._stake_pool_exchange_rate(self.balances, self.asset_supply),
             "total_staked_ocn": self.balances.get((self.STAKE_POOL_ADDRESS, "OCN"), 0),
             "total_stocn_supply": self.asset_supply.get("stOCN", 0),
+        }
+
+    def list_pools(self):
+        """Every pool_key that has ever had liquidity added — derived from
+        self.asset_supply's "LP:" keys (an "LP:{pool_key}" asset only ever
+        exists once pool_add_liquidity has minted some of it at least once)
+        rather than a separate tracked set, since this implementation
+        deliberately skipped a standalone pool_create op (see
+        test_amm_pools.py's module docstring): a pool has no meaningful
+        state to "exist" ahead of its first real liquidity deposit."""
+        return sorted(asset_id[len("LP:"):] for asset_id in self.asset_supply if asset_id.startswith("LP:"))
+
+    def pool_status(self, pool_key):
+        """Read-only snapshot for node.py's /pools/<id> — reserves, LP
+        supply, and derived spot price for one AMM pool. Always derived
+        from the live self.balances/self.asset_supply index, same as
+        stake_pool_status above; returns zeros for a pool_key nobody has
+        ever added liquidity to rather than raising, so callers can use
+        this to check "does this pool have anything in it yet"."""
+        self._validate_pool_key(pool_key)
+        asset_a, asset_b = pool_key.split(":")
+        pool_addr = self._pool_address(pool_key)
+        lp_asset = self._lp_asset_id(pool_key)
+        reserve_a = self.balances.get((pool_addr, asset_a), 0)
+        reserve_b = self.balances.get((pool_addr, asset_b), 0)
+        return {
+            "pool_key": pool_key,
+            "pool_address": pool_addr,
+            "asset_a": asset_a, "reserve_a": reserve_a,
+            "asset_b": asset_b, "reserve_b": reserve_b,
+            "lp_asset": lp_asset,
+            "lp_supply": self.asset_supply.get(lp_asset, 0),
+            "price_a_in_b": (reserve_b / reserve_a) if reserve_a > 0 else None,
+            "price_b_in_a": (reserve_a / reserve_b) if reserve_b > 0 else None,
         }
 
     @staticmethod
@@ -607,6 +724,124 @@ class Blockchain:
             balances[pool_key] = balances.get(pool_key, 0) - redeemed_ocn
             recipient_key = (tx.recipient, "OCN")  # tx.recipient == tx.sender, enforced by _validate_op
             balances[recipient_key] = balances.get(recipient_key, 0) + redeemed_ocn
+            return debited
+        if tx.op == "pool_add_liquidity":
+            pool_key = tx.op_data["pool_key"]
+            asset_a, asset_b = pool_key.split(":")
+            amount_a, amount_b = tx.op_data["amount_a"], tx.op_data["amount_b"]
+            pool_addr = Blockchain._pool_address(pool_key)
+            lp_asset = Blockchain._lp_asset_id(pool_key)
+            reserve_a = balances.get((pool_addr, asset_a), 0)
+            reserve_b = balances.get((pool_addr, asset_b), 0)
+            lp_supply = asset_supply.get(lp_asset, 0)
+            if lp_supply <= 0 or reserve_a <= 0 or reserve_b <= 0:
+                # Bootstrap mint (Uniswap V2's formula) — sqrt is the ONE
+                # transcendental-looking op used anywhere in this file's
+                # consensus math, and it's safe specifically BECAUSE unlike
+                # pow/exp/log with an irrational exponent (see
+                # REWARD_DECAY_RATE_FIXED's docstring for why THAT one isn't
+                # safe), IEEE 754 requires sqrt to be correctly rounded —
+                # identical on every conformant platform, same guarantee
+                # reward_at_height's own docstring already relies on for
+                # plain division.
+                minted_lp = round((amount_a * amount_b) ** 0.5, 6)
+            else:
+                # Proportional to existing reserves, using whichever side
+                # is the SMALLER ratio — protects existing LPs from a
+                # lopsided deposit minting more LP than either side of the
+                # contribution actually justifies (same rule Uniswap V2
+                # enforces the same way).
+                minted_lp = round(min(amount_a / reserve_a, amount_b / reserve_b) * lp_supply, 6)
+            if tx.sender != "0":
+                fee_key = (tx.sender, "OCN")
+                balances[fee_key] = balances.get(fee_key, 0) - tx.fee
+                debited.append(fee_key)
+                a_key = (tx.sender, asset_a)
+                balances[a_key] = balances.get(a_key, 0) - amount_a
+                debited.append(a_key)
+                b_key = (tx.sender, asset_b)
+                balances[b_key] = balances.get(b_key, 0) - amount_b
+                debited.append(b_key)
+            pool_a_key = (pool_addr, asset_a)
+            balances[pool_a_key] = balances.get(pool_a_key, 0) + amount_a
+            pool_b_key = (pool_addr, asset_b)
+            balances[pool_b_key] = balances.get(pool_b_key, 0) + amount_b
+            lp_key = (tx.sender, lp_asset)
+            balances[lp_key] = balances.get(lp_key, 0) + minted_lp
+            asset_supply[lp_asset] = asset_supply.get(lp_asset, 0) + minted_lp
+            return debited
+        if tx.op == "pool_swap":
+            pool_key = tx.op_data["pool_key"]
+            asset_a, asset_b = pool_key.split(":")
+            asset_in = tx.op_data["asset_in"]
+            asset_out = asset_b if asset_in == asset_a else asset_a
+            amount_in = tx.op_data["amount_in"]
+            min_amount_out = tx.op_data.get("min_amount_out", 0)
+            pool_addr = Blockchain._pool_address(pool_key)
+            reserve_in = balances.get((pool_addr, asset_in), 0)
+            reserve_out = balances.get((pool_addr, asset_out), 0)
+            # Constant product x*y=k with a 0.3% input-side fee, integer
+            # ratio only (see POOL_SWAP_FEE_NUMERATOR/DENOMINATOR) — no
+            # float anywhere in the actual output calculation until the
+            # single final division, which (like reward_at_height's own
+            # final division) IEEE 754 guarantees is correctly rounded.
+            amount_in_after_fee = amount_in * Blockchain.POOL_SWAP_FEE_NUMERATOR
+            denominator = reserve_in * Blockchain.POOL_SWAP_FEE_DENOMINATOR + amount_in_after_fee
+            amount_out = round((amount_in_after_fee * reserve_out) / denominator, 6) if denominator > 0 else 0
+            if amount_out < min_amount_out:
+                # State-dependent slippage failure — can't be caught by
+                # _validate_op (which only sees the transaction, never
+                # chain state), so this is the one op that can make this
+                # normally-never-raises accounting function raise. Every
+                # caller (add_transaction, accept_block, is_chain_valid)
+                # already treats a ValueError from validation as this
+                # transaction/block being rejected.
+                raise ValueError(f"pool_swap would output {amount_out} {asset_out}, below min_amount_out {min_amount_out} (slippage)")
+            if tx.sender != "0":
+                fee_key = (tx.sender, "OCN")
+                balances[fee_key] = balances.get(fee_key, 0) - tx.fee
+                debited.append(fee_key)
+                in_key = (tx.sender, asset_in)
+                balances[in_key] = balances.get(in_key, 0) - amount_in
+                debited.append(in_key)
+            pool_in_key = (pool_addr, asset_in)
+            balances[pool_in_key] = balances.get(pool_in_key, 0) + amount_in
+            pool_out_key = (pool_addr, asset_out)
+            balances[pool_out_key] = balances.get(pool_out_key, 0) - amount_out
+            debited.append(pool_out_key)  # the pool's own reserve must never go negative either — mathematically guaranteed by the formula above, checked anyway as a free safety net
+            recipient_key = (tx.recipient, asset_out)  # tx.recipient == tx.sender, enforced by _validate_op
+            balances[recipient_key] = balances.get(recipient_key, 0) + amount_out
+            return debited
+        if tx.op == "pool_remove_liquidity":
+            pool_key = tx.op_data["pool_key"]
+            asset_a, asset_b = pool_key.split(":")
+            lp_amount = tx.op_data["lp_amount"]
+            pool_addr = Blockchain._pool_address(pool_key)
+            lp_asset = Blockchain._lp_asset_id(pool_key)
+            lp_supply = asset_supply.get(lp_asset, 0)
+            reserve_a = balances.get((pool_addr, asset_a), 0)
+            reserve_b = balances.get((pool_addr, asset_b), 0)
+            share = (lp_amount / lp_supply) if lp_supply > 0 else 0
+            out_a = round(reserve_a * share, 6)
+            out_b = round(reserve_b * share, 6)
+            lp_key = (tx.sender, lp_asset)
+            balances[lp_key] = balances.get(lp_key, 0) - lp_amount
+            debited.append(lp_key)
+            asset_supply[lp_asset] = asset_supply.get(lp_asset, 0) - lp_amount
+            if tx.sender != "0":
+                fee_key = (tx.sender, "OCN")
+                balances[fee_key] = balances.get(fee_key, 0) - tx.fee
+                debited.append(fee_key)
+            pool_a_key = (pool_addr, asset_a)
+            balances[pool_a_key] = balances.get(pool_a_key, 0) - out_a
+            debited.append(pool_a_key)
+            pool_b_key = (pool_addr, asset_b)
+            balances[pool_b_key] = balances.get(pool_b_key, 0) - out_b
+            debited.append(pool_b_key)
+            recipient_a_key = (tx.recipient, asset_a)  # tx.recipient == tx.sender, enforced by _validate_op
+            balances[recipient_a_key] = balances.get(recipient_a_key, 0) + out_a
+            recipient_b_key = (tx.recipient, asset_b)
+            balances[recipient_b_key] = balances.get(recipient_b_key, 0) + out_b
             return debited
         # Plain transfer (op=None) or transfer_asset — the original A1/A3
         # accounting: net total_cost() for the sender when the moved asset
@@ -1116,9 +1351,12 @@ class Blockchain:
                 for tx in op_txs:
                     try:
                         self._validate_op(tx)
+                        # pool_swap can raise for a state-dependent reason
+                        # (slippage) that _validate_op alone can't see —
+                        # same try/except needed here.
+                        debited_keys = self._apply_transaction_to_balance_dict(scratch_balances, tx, scratch_supply)
                     except ValueError:
                         return False
-                    debited_keys = self._apply_transaction_to_balance_dict(scratch_balances, tx, scratch_supply)
                     for key in debited_keys:
                         if scratch_balances.get(key, 0) < 0:
                             return False
