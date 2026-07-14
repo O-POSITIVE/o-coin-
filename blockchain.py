@@ -443,66 +443,122 @@ class Blockchain:
         self.pos_target = min(new_target, self.POS_MAX_TARGET)
 
     # ── Mempool / transactions ────────────────────────────────────────
-    def _apply_transaction_to_balances(self, tx):
-        """Same accounting get_balance's full-scan path uses (net
-        total_cost() for the sender, amount for the recipient), applied to
-        self.balances in place. Factored out so _rebuild_balance_index and
-        accept_block's incremental update can never silently drift apart —
-        both funnel through this one place."""
+    # Track A, Phase A2/A3: reject any op-bearing transaction before this
+    # height, so the multi-asset cutover is a deliberate, coordinated event
+    # rather than something that could activate by surprise the moment this
+    # code merely ships. Deliberately a huge placeholder, not "current tip +
+    # small buffer" — the real value has to be chosen WITH the user at
+    # actual deployment time (this is the hard-fork line: every node must be
+    # running this code before it, see docs/07-onchain-dex-plan.md A2). Until
+    # that's deliberately lowered, op-bearing transactions can't activate on
+    # the real chain even if this code reaches it.
+    TX_SCHEMA_ACTIVATION_HEIGHT = 1_000_000
+
+    # The only op recognized so far (Phase A3's plain multi-asset transfer).
+    # A4/A5 add to this set when those phases are actually built — never an
+    # open "anything goes" op namespace.
+    KNOWN_OPS = {"transfer_asset"}
+
+    @staticmethod
+    def _asset_id_of(tx):
+        """Every transaction moves SOME asset — plain transfers (op=None,
+        every transaction that existed before Phase A2) always move "OCN";
+        a transfer_asset op moves whatever asset_id its op_data names.
+        Centralized here so nothing else has to duplicate this branch."""
+        if tx.op == "transfer_asset" and tx.op_data:
+            return tx.op_data.get("asset_id", "OCN")
+        return "OCN"
+
+    @staticmethod
+    def _validate_op(tx):
+        """Structural validation of an op-bearing transaction's op_data —
+        raises ValueError with a human-readable reason, same convention as
+        add_transaction. Called from both add_transaction (mempool gate) and
+        accept_block (block gate) so a malformed op can never reach the
+        chain by skipping mempool admission (e.g. a block submitted directly
+        by a miner/peer)."""
+        if tx.op not in Blockchain.KNOWN_OPS:
+            raise ValueError(f"Unknown transaction op: {tx.op}")
+        if tx.op == "transfer_asset":
+            asset_id = (tx.op_data or {}).get("asset_id") if tx.op_data else None
+            if not isinstance(asset_id, str) or not asset_id:
+                raise ValueError("transfer_asset requires op_data.asset_id (non-empty string)")
+            if asset_id == "OCN":
+                raise ValueError('transfer_asset cannot move "OCN" — use a plain transfer (op=None) for OCN itself')
+
+    @staticmethod
+    def _apply_transaction_to_balance_dict(balances, tx):
+        """The one place transaction accounting actually happens — same
+        semantics the original OCN-only get_balance always used (net
+        total_cost() for the sender, amount for the recipient), generalized
+        to (address, asset_id) keys. A transfer_asset op debits the asset
+        amount from the sender's asset balance and the fee separately from
+        their OCN balance (fees are always paid in OCN, regardless of what
+        asset a transaction moves — same "cheap, fast" fee market for every
+        asset, not a separate market per asset). Operates on a passed-in
+        dict rather than self.balances directly so it can be reused both for
+        the real index (_rebuild_balance_index/accept_block) and for
+        throwaway local dicts (get_balance's explicit chain= scan,
+        is_chain_valid's from-scratch per-candidate walk, add_transaction's
+        pending-mempool check) without duplicating this logic anywhere and
+        risking the copies drifting apart."""
+        asset_id = Blockchain._asset_id_of(tx)
         if tx.sender != "0":
-            key = (tx.sender, "OCN")
-            self.balances[key] = self.balances.get(key, 0) - tx.total_cost()
-        key = (tx.recipient, "OCN")
-        self.balances[key] = self.balances.get(key, 0) + tx.amount
+            if asset_id == "OCN":
+                key = (tx.sender, "OCN")
+                balances[key] = balances.get(key, 0) - tx.total_cost()
+            else:
+                fee_key = (tx.sender, "OCN")
+                balances[fee_key] = balances.get(fee_key, 0) - tx.fee
+                asset_key = (tx.sender, asset_id)
+                balances[asset_key] = balances.get(asset_key, 0) - tx.amount
+        recipient_key = (tx.recipient, asset_id)
+        balances[recipient_key] = balances.get(recipient_key, 0) + tx.amount
+
+    def _apply_transaction_to_balances(self, tx):
+        self._apply_transaction_to_balance_dict(self.balances, tx)
 
     def _rebuild_balance_index(self):
-        """Full walk of self.chain, recomputing every address's OCN
-        balance from scratch into self.balances. Called whenever self.chain
-        is replaced WHOLESALE — genesis creation, load_chain() adopting the
-        startup chain, replace_chain() swapping in a candidate — as opposed
-        to growing by one block, which accept_block updates incrementally
-        instead (see _apply_transaction_to_balances). asset_id is hardcoded
-        to "OCN" throughout since no other asset exists yet; this is purely
-        so a later multi-asset ledger doesn't have to touch every read/write
-        site in this index again."""
+        """Full walk of self.chain, recomputing every address's balance
+        (across every asset_id seen) from scratch into self.balances. Called
+        whenever self.chain is replaced WHOLESALE — genesis creation,
+        load_chain() adopting the startup chain, replace_chain() swapping in
+        a candidate — as opposed to growing by one block, which accept_block
+        updates incrementally instead (see _apply_transaction_to_balances)."""
         self.balances = {}
         for block in self.chain:
             for tx in block.transactions:
                 self._apply_transaction_to_balances(tx)
 
-    def get_balance(self, address, include_pending=False, chain=None):
-        """Walks the confirmed chain (and optionally the mempool) summing
-        sends/receives (net of fees paid) for one address. No account/
-        balance table exists anywhere — a wallet's balance is always
-        *derived* from transaction history, same as every real UTXO-model
-        or account-model chain; there's nothing else to trust or that
-        could get out of sync.
+    def get_balance(self, address, asset_id="OCN", include_pending=False, chain=None):
+        """Balance of one (address, asset_id) pair. No account/balance table
+        exists anywhere — a wallet's balance is always *derived* from
+        transaction history, same as every real UTXO-model or account-model
+        chain; there's nothing else to trust or that could get out of sync.
 
-        Accepts an explicit `chain` (used by is_chain_valid when checking
-        a CANDIDATE chain's stake weights against ITS OWN history, not
-        necessarily this instance's currently-accepted one) — that path
-        stays a full from-scratch scan, deliberately untouched by the
-        index below: the index only ever reflects self.chain as currently
-        adopted, and validating a not-yet-adopted candidate must stay
-        fully independent of it. Every other (the overwhelming majority
-        of) caller passes no chain and gets the O(1) indexed lookup
-        instead of a full scan."""
+        Accepts an explicit `chain` (used by is_chain_valid when checking a
+        CANDIDATE chain's stake weights/balances against ITS OWN history,
+        not necessarily this instance's currently-accepted one) — that path
+        stays a full from-scratch scan: the index only ever reflects
+        self.chain as currently adopted, and validating a not-yet-adopted
+        candidate must stay fully independent of it. Every other (the
+        overwhelming majority of) caller passes no chain and gets the O(1)
+        indexed lookup instead of a full scan. Both paths funnel through
+        _apply_transaction_to_balance_dict so they can never compute two
+        different answers for the same chain."""
         if chain is not None:
-            balance = 0
+            local = {}
             for block in chain:
                 for tx in block.transactions:
-                    if tx.sender == address:
-                        balance -= tx.total_cost()
-                    if tx.recipient == address:
-                        balance += tx.amount
+                    self._apply_transaction_to_balance_dict(local, tx)
+            balance = local.get((address, asset_id), 0)
         else:
-            balance = self.balances.get((address, "OCN"), 0)
+            balance = self.balances.get((address, asset_id), 0)
         if include_pending:
+            pending_local = {}
             for tx in self.mempool:
-                if tx.sender == address:
-                    balance -= tx.total_cost()
-                if tx.recipient == address:
-                    balance += tx.amount
+                self._apply_transaction_to_balance_dict(pending_local, tx)
+            balance += pending_local.get((address, asset_id), 0)
         return balance
 
     def add_transaction(self, tx: Transaction):
@@ -510,6 +566,10 @@ class Blockchain:
         callers (the HTTP API) turn that straight into an error response."""
         if not tx.is_valid():
             raise ValueError("Transaction signature is invalid (or fee is below the network minimum)")
+        if tx.op is not None:
+            if (self.latest_block.index + 1) < self.TX_SCHEMA_ACTIVATION_HEIGHT:
+                raise ValueError(f"op-bearing transactions are not active until block {self.TX_SCHEMA_ACTIVATION_HEIGHT}")
+            self._validate_op(tx)
         # Replay/double-inclusion guard: a signed transaction's hash is
         # fully deterministic from its own fields (see
         # Transaction.to_signing_string) — nothing about a signature
@@ -533,9 +593,22 @@ class Blockchain:
             # problem proof-of-work chains exist to solve for confirmed
             # blocks — this closes the same gap one step earlier, at
             # mempool-acceptance time).
-            available = self.get_balance(tx.sender, include_pending=True)
-            if available < tx.total_cost():
-                raise ValueError(f"Insufficient balance: {tx.sender} has {available}, tried to send {tx.amount} + {tx.fee} fee")
+            asset_id = self._asset_id_of(tx)
+            if asset_id == "OCN":
+                available = self.get_balance(tx.sender, include_pending=True)
+                if available < tx.total_cost():
+                    raise ValueError(f"Insufficient balance: {tx.sender} has {available}, tried to send {tx.amount} + {tx.fee} fee")
+            else:
+                # Fee is always paid in OCN regardless of what asset the
+                # transaction itself moves — checked separately from the
+                # asset amount, which draws from a completely different
+                # balance bucket.
+                available_fee = self.get_balance(tx.sender, include_pending=True)
+                if available_fee < tx.fee:
+                    raise ValueError(f"Insufficient OCN balance for fee: {tx.sender} has {available_fee}, needs {tx.fee}")
+                available_asset = self.get_balance(tx.sender, asset_id=asset_id, include_pending=True)
+                if available_asset < tx.amount:
+                    raise ValueError(f"Insufficient {asset_id} balance: {tx.sender} has {available_asset}, tried to send {tx.amount}")
         self.mempool.append(tx)
         return tx.hash()
 
@@ -781,6 +854,31 @@ class Blockchain:
         for tx in block.transactions:
             if not tx.is_valid():
                 raise ValueError(f"Block contains an invalid transaction: {tx.hash()}")
+        # Track A, Phase A2/A3: op-bearing transactions get their OWN
+        # block-level invariant checks — unlike OCN transfers (whose balance
+        # sufficiency is ONLY ever checked at mempool-admission time, a
+        # pre-existing, deliberately out-of-scope gap for A1/A2/A3 — see
+        # docs/07-onchain-dex-plan.md's ground constraints), a new asset type
+        # has no such inherited coverage, so a malicious block could
+        # otherwise manufacture spends against a balance that was never
+        # really there. Checked against a running copy seeded from the
+        # currently-indexed balances (not self.balances itself — this block
+        # isn't appended yet) so multiple ops from the same sender within
+        # one block are checked cumulatively against each other, not just
+        # independently against pre-block state.
+        op_txs = [tx for tx in block.transactions if tx.op is not None]
+        if op_txs:
+            if block.index < self.TX_SCHEMA_ACTIVATION_HEIGHT:
+                raise ValueError(f"Block contains op-bearing transactions before activation height {self.TX_SCHEMA_ACTIVATION_HEIGHT}")
+            running = dict(self.balances)
+            for tx in op_txs:
+                self._validate_op(tx)
+                if tx.sender != "0":
+                    asset_id = self._asset_id_of(tx)
+                    key = (tx.sender, asset_id)
+                    if running.get(key, 0) < tx.amount:
+                        raise ValueError(f"Block contains a transfer_asset transaction spending more {asset_id} than {tx.sender} has")
+                self._apply_transaction_to_balance_dict(running, tx)
         self.chain.append(block)
         # O(1) incremental update — the common case, a full rebuild would
         # be wasteful here since only this one block's worth of
@@ -830,6 +928,18 @@ class Blockchain:
         chain = chain if chain is not None else self.chain
         if not chain or chain[0].previous_hash != "0" * 64:
             return False
+        # Track A, Phase A2/A3: independently re-derived, running balances
+        # for this CANDIDATE chain specifically (never self.balances — this
+        # function must never trust that a candidate ever passed through
+        # accept_block) so op-bearing transactions' block-level invariant
+        # (see accept_block) can be re-checked from scratch here too, the
+        # same "trust nothing, verify everything" standard every other rule
+        # in this function already holds itself to. Maintained incrementally
+        # as the loop below walks the chain in increasing order, one
+        # block's worth of transactions at a time.
+        running_balances = {}
+        for tx in chain[0].transactions:
+            self._apply_transaction_to_balance_dict(running_balances, tx)
         for i in range(1, len(chain)):
             block, prev = chain[i], chain[i - 1]
             if block.previous_hash != prev.compute_hash():
@@ -868,6 +978,26 @@ class Blockchain:
             confirmed_hashes = {t.hash() for b in chain[:i] for t in b.transactions if t.sender != "0"}
             if any(h in confirmed_hashes for h in signed_hashes):
                 return False
+            # Same op/asset-balance invariant accept_block enforces (see
+            # that method's comment for the full reasoning), re-derived
+            # from scratch against running_balances as accumulated up to
+            # (but not including) this block.
+            op_txs = [tx for tx in block.transactions if tx.op is not None]
+            if op_txs:
+                if block.index < self.TX_SCHEMA_ACTIVATION_HEIGHT:
+                    return False
+                for tx in op_txs:
+                    try:
+                        self._validate_op(tx)
+                    except ValueError:
+                        return False
+                    if tx.sender != "0":
+                        asset_id = self._asset_id_of(tx)
+                        key = (tx.sender, asset_id)
+                        if running_balances.get(key, 0) < tx.amount:
+                            return False
+            for tx in block.transactions:
+                self._apply_transaction_to_balance_dict(running_balances, tx)
             for tx in block.transactions:
                 if not tx.is_valid():
                     return False

@@ -39,7 +39,7 @@ MIN_FEE = 0.01
 
 
 class Transaction:
-    def __init__(self, sender, recipient, amount, fee=None, public_key=None, signature=None, timestamp=None):
+    def __init__(self, sender, recipient, amount, fee=None, public_key=None, signature=None, timestamp=None, op=None, op_data=None):
         self.sender = sender
         self.recipient = recipient
         self.amount = amount
@@ -47,6 +47,17 @@ class Transaction:
         self.timestamp = timestamp if timestamp is not None else time.time()
         self.public_key = public_key  # hex-encoded sender public key, present on every non-coinbase tx
         self.signature = signature    # hex-encoded signature, present on every non-coinbase tx
+        # Optional, default None (Track A, Phase A2) — a plain transfer
+        # (op=None) must sign/hash EXACTLY as it always has, or every
+        # already-broadcast signature in chain history would stop
+        # verifying. op is a short op-name string ("transfer_asset", pool
+        # ops, etc. — see blockchain.py); op_data is whatever dict that op
+        # needs. Both ride inside the signed message (see
+        # to_signing_string) specifically so nobody can intercept a
+        # broadcast op transaction and rewrite its op_data before it's
+        # mined without invalidating the signature, same reasoning as fee.
+        self.op = op
+        self.op_data = op_data
 
     def to_signing_string(self):
         # Deliberately excludes public_key/signature themselves — this is
@@ -55,13 +66,24 @@ class Transaction:
         # it must be, or someone could intercept a broadcast transaction
         # and lower/raise its fee before it reaches a miner, without
         # invalidating the signature.
-        return json.dumps({
+        fields = {
             "sender": self.sender,
             "recipient": self.recipient,
             "amount": self.amount,
             "fee": self.fee,
             "timestamp": self.timestamp,
-        }, sort_keys=True)
+        }
+        # op/op_data only enter the signed message when actually set — a
+        # plain transfer (op=None, the only kind that existed before Phase
+        # A2) produces the IDENTICAL 5-key JSON this always produced, so
+        # every transaction ever signed before this field existed still
+        # verifies unchanged. This is the one thing that makes the whole
+        # schema extension backward-compatible rather than a silent hard
+        # fork on every historical signature.
+        if self.op is not None:
+            fields["op"] = self.op
+            fields["op_data"] = self.op_data
+        return json.dumps(fields, sort_keys=True)
 
     def sign(self, wallet):
         """wallet is a Wallet instance (see wallet.py) — must belong to
@@ -73,7 +95,12 @@ class Transaction:
 
     def is_valid(self):
         if self.sender == "0":
-            return True  # coinbase (mining reward + fees) — no signature required
+            # Coinbase is reward-only — every real one built by blockchain.py
+            # (mining/pool/staking reward txs) never sets op, so this is a
+            # no-op for anything legitimate; it just closes off "sender=0
+            # AND carries a user-directed op" as a combination nothing
+            # should ever construct.
+            return self.op is None
         if self.amount <= 0:
             return False
         if self.fee < MIN_FEE:
@@ -108,6 +135,7 @@ class Transaction:
             "sender": self.sender, "recipient": self.recipient, "amount": self.amount,
             "fee": self.fee, "timestamp": self.timestamp,
             "public_key": self.public_key, "signature": self.signature,
+            "op": self.op, "op_data": self.op_data,
         }
 
     @staticmethod
@@ -115,4 +143,5 @@ class Transaction:
         return Transaction(
             d["sender"], d["recipient"], d["amount"], d.get("fee"),
             d.get("public_key"), d.get("signature"), d.get("timestamp"),
+            d.get("op"), d.get("op_data"),
         )
