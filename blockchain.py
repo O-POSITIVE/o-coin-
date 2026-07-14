@@ -446,13 +446,16 @@ class Blockchain:
     # Track A, Phase A2/A3: reject any op-bearing transaction before this
     # height, so the multi-asset cutover is a deliberate, coordinated event
     # rather than something that could activate by surprise the moment this
-    # code merely ships. Deliberately a huge placeholder, not "current tip +
-    # small buffer" — the real value has to be chosen WITH the user at
-    # actual deployment time (this is the hard-fork line: every node must be
-    # running this code before it, see docs/07-onchain-dex-plan.md A2). Until
-    # that's deliberately lowered, op-bearing transactions can't activate on
-    # the real chain even if this code reaches it.
-    TX_SCHEMA_ACTIVATION_HEIGHT = 1_000_000
+    # code merely ships. REAL VALUE CHOSEN 2026-07-14 with the user: the
+    # live chain was at height 40, user picked "current + 50" -> 90. Every
+    # phase (A1-A7) was built, unit-tested, AND live-network-tested
+    # (test_live_network.py, real multi-node HTTP) before this was set —
+    # see docs/07-onchain-dex-plan.md in the trading-platform repo for the
+    # full plan this activates. From block 90 onward, op-bearing
+    # transactions (multi-asset transfers, the stOCN liquid-staking pool,
+    # the OCN:stOCN AMM pool) are accepted; before it, rejected, exactly
+    # as they always were.
+    TX_SCHEMA_ACTIVATION_HEIGHT = 90
 
     # Recognized ops — never an open "anything goes" op namespace.
     KNOWN_OPS = {
