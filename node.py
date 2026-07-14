@@ -201,6 +201,19 @@ def load_chain():
         print(f"WARNING: {BLOCKS_TABLE} failed validation, starting from genesis instead")
 
 
+def _peer_headers():
+    """Every peer-to-peer call needs the SAME shared-secret header a
+    trusted client (trading-platform's server.py) sends — peer nodes are
+    assumed to be other trusted members of one private cluster all
+    configured with the same OCOIN_NODE_SHARED_SECRET, not arbitrary
+    public nodes. Track A, Phase A6 found this was missing on BOTH
+    peer-sync paths below (broadcast_block AND _resolve_with_peers) via a
+    real two-node HTTP test — /blocks/receive and /chain both sit behind
+    _require_shared_secret, so peer sync was silently 401ing on itself
+    the moment a secret was ever configured, for every path, not just one."""
+    return {"X-Node-Auth": NODE_SHARED_SECRET} if NODE_SHARED_SECRET else {}
+
+
 def broadcast_block(block: Block):
     """Fire-and-forget push to every known peer — short timeout, errors
     swallowed, since a slow/offline peer should never hold up this node's
@@ -209,10 +222,11 @@ def broadcast_block(block: Block):
     calls /nodes/resolve, so this is a speed optimization, not a
     correctness dependency."""
     payload = block.to_dict()
+    headers = _peer_headers()
     for peer in list(peers):
         def _send(url=peer):
             try:
-                requests.post(f"{url}/blocks/receive", json=payload, timeout=2)
+                requests.post(f"{url}/blocks/receive", json=payload, headers=headers, timeout=2)
             except requests.RequestException:
                 pass
         threading.Thread(target=_send, daemon=True).start()
@@ -240,11 +254,18 @@ def get_chain():
 
 @app.route("/balance/<address>")
 def get_balance(address):
+    """?asset_id=... (optional, default "OCN") — Track A, Phase A7. Without
+    this, there was no way to check a stOCN/LP balance via the API at all,
+    only aggregate pool-wide figures from /stake_pool/status or
+    /pools/<pool_key>. Defaults to "OCN" so every existing caller (nothing
+    passes asset_id today) gets byte-identical behavior to before."""
+    asset_id = request.args.get("asset_id", "OCN")
     with chain_lock:
         return jsonify({
             "address": address,
-            "balance": blockchain.get_balance(address),
-            "balance_with_pending": blockchain.get_balance(address, include_pending=True),
+            "asset_id": asset_id,
+            "balance": blockchain.get_balance(address, asset_id=asset_id),
+            "balance_with_pending": blockchain.get_balance(address, asset_id=asset_id, include_pending=True),
         })
 
 
@@ -468,10 +489,11 @@ def _resolve_with_peers():
     (a natural, expected occurrence, not an error) converge back onto a
     single agreed history once one side pulls further ahead."""
     replaced = False
+    headers = _peer_headers()
     with chain_lock:
         for peer in list(peers):
             try:
-                resp = requests.get(f"{peer}/chain", timeout=5)
+                resp = requests.get(f"{peer}/chain", headers=headers, timeout=5)
                 data = resp.json()
                 candidate = [Block.from_dict(b) for b in data["chain"]]
                 if blockchain.replace_chain(candidate):
