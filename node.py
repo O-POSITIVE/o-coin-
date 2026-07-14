@@ -184,6 +184,7 @@ def load_chain():
     candidate = [blockchain.chain[0]] + loaded_blocks
     if blockchain.is_chain_valid(candidate):
         blockchain.chain = candidate
+        blockchain._rebuild_balance_index()
         # Pick each target from the last block of ITS OWN kind, not just
         # candidate[-1] — the tip could be either a PoW or a PoS block,
         # and blindly reading .target off whichever one happens to be

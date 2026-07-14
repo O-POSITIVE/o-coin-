@@ -373,6 +373,7 @@ class Blockchain:
         self.current_target = self.INITIAL_TARGET
         self.pos_target = 2 ** 256 // (self.TARGET_BLOCK_TIME * max(1, self.GENESIS_PREMINE_AMOUNT))
         self._create_genesis_block()
+        self._rebuild_balance_index()
 
     def _create_genesis_block(self):
         premine_tx = Transaction(
@@ -442,6 +443,33 @@ class Blockchain:
         self.pos_target = min(new_target, self.POS_MAX_TARGET)
 
     # ── Mempool / transactions ────────────────────────────────────────
+    def _apply_transaction_to_balances(self, tx):
+        """Same accounting get_balance's full-scan path uses (net
+        total_cost() for the sender, amount for the recipient), applied to
+        self.balances in place. Factored out so _rebuild_balance_index and
+        accept_block's incremental update can never silently drift apart —
+        both funnel through this one place."""
+        if tx.sender != "0":
+            key = (tx.sender, "OCN")
+            self.balances[key] = self.balances.get(key, 0) - tx.total_cost()
+        key = (tx.recipient, "OCN")
+        self.balances[key] = self.balances.get(key, 0) + tx.amount
+
+    def _rebuild_balance_index(self):
+        """Full walk of self.chain, recomputing every address's OCN
+        balance from scratch into self.balances. Called whenever self.chain
+        is replaced WHOLESALE — genesis creation, load_chain() adopting the
+        startup chain, replace_chain() swapping in a candidate — as opposed
+        to growing by one block, which accept_block updates incrementally
+        instead (see _apply_transaction_to_balances). asset_id is hardcoded
+        to "OCN" throughout since no other asset exists yet; this is purely
+        so a later multi-asset ledger doesn't have to touch every read/write
+        site in this index again."""
+        self.balances = {}
+        for block in self.chain:
+            for tx in block.transactions:
+                self._apply_transaction_to_balances(tx)
+
     def get_balance(self, address, include_pending=False, chain=None):
         """Walks the confirmed chain (and optionally the mempool) summing
         sends/receives (net of fees paid) for one address. No account/
@@ -452,15 +480,23 @@ class Blockchain:
 
         Accepts an explicit `chain` (used by is_chain_valid when checking
         a CANDIDATE chain's stake weights against ITS OWN history, not
-        necessarily this instance's currently-accepted one) — defaults to
-        self.chain for every normal caller."""
-        balance = 0
-        for block in (chain if chain is not None else self.chain):
-            for tx in block.transactions:
-                if tx.sender == address:
-                    balance -= tx.total_cost()
-                if tx.recipient == address:
-                    balance += tx.amount
+        necessarily this instance's currently-accepted one) — that path
+        stays a full from-scratch scan, deliberately untouched by the
+        index below: the index only ever reflects self.chain as currently
+        adopted, and validating a not-yet-adopted candidate must stay
+        fully independent of it. Every other (the overwhelming majority
+        of) caller passes no chain and gets the O(1) indexed lookup
+        instead of a full scan."""
+        if chain is not None:
+            balance = 0
+            for block in chain:
+                for tx in block.transactions:
+                    if tx.sender == address:
+                        balance -= tx.total_cost()
+                    if tx.recipient == address:
+                        balance += tx.amount
+        else:
+            balance = self.balances.get((address, "OCN"), 0)
         if include_pending:
             for tx in self.mempool:
                 if tx.sender == address:
@@ -746,6 +782,12 @@ class Blockchain:
             if not tx.is_valid():
                 raise ValueError(f"Block contains an invalid transaction: {tx.hash()}")
         self.chain.append(block)
+        # O(1) incremental update — the common case, a full rebuild would
+        # be wasteful here since only this one block's worth of
+        # transactions actually changed anything (see _rebuild_balance_index
+        # for the wholesale-replacement counterpart to this).
+        for tx in block.transactions:
+            self._apply_transaction_to_balances(tx)
         # Remove any mempool transactions that made it into this block —
         # by hash, so this works regardless of which miner/node actually
         # produced the block.
@@ -862,6 +904,7 @@ class Blockchain:
         if not self.is_chain_valid(candidate_chain):
             return False
         self.chain = candidate_chain
+        self._rebuild_balance_index()
         # The chain's last block might be either type — its own .target
         # only tells us ONE of current_target/pos_target, never both, so
         # each needs to be picked up from the last block of ITS OWN kind
