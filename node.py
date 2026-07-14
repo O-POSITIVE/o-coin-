@@ -523,6 +523,16 @@ def pos_status():
     return jsonify(payload)
 
 
+@app.route("/stake_pool/status")
+def stake_pool_status():
+    """Track A, Phase A4/A7 — read-only liquid-staking-pool snapshot
+    (exchange rate, total OCN staked, total stOCN outstanding). No address
+    param, unlike /pos/status: the pool address is a fixed protocol
+    constant (Blockchain.STAKE_POOL_ADDRESS), not something a caller picks."""
+    with chain_lock:
+        return jsonify(blockchain.stake_pool_status())
+
+
 @app.route("/pos/stake")
 def stake_here():
     """Convenience endpoint mirroring /mine: one single kernel-check

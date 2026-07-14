@@ -101,8 +101,19 @@ class Transaction:
             # AND carries a user-directed op" as a combination nothing
             # should ever construct.
             return self.op is None
-        if self.amount <= 0:
-            return False
+        if self.op is None:
+            if self.amount <= 0:
+                return False
+        else:
+            # Op-bearing transactions may legitimately carry amount=0 — the
+            # AMM pool ops (see blockchain.py) put every quantity they move
+            # inside op_data (which is signed, via to_signing_string) and
+            # use the amount field for nothing. Negative is still always
+            # nonsense. Per-op amount rules (which ops NEED amount>0, which
+            # REQUIRE it to be 0) are enforced in Blockchain._validate_op,
+            # next to the rest of each op's structural rules.
+            if self.amount < 0:
+                return False
         if self.fee < MIN_FEE:
             return False
         if not self.signature or not self.public_key:
