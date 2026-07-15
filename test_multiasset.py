@@ -62,36 +62,61 @@ else:
     loaded_blocks = [Block.from_dict(r[0]) for r in rows]
     candidate = [real_chain_obj.chain[0]] + loaded_blocks
     assert real_chain_obj.is_chain_valid(candidate) is True, "real chain must still validate under the new rules"
-    print(f"  is_chain_valid: True over {len(candidate)} real blocks (unchanged — none of them carry an op)")
+    print(f"  is_chain_valid: True over {len(candidate)} real blocks")
 
+    # The live chain now contains BOTH eras for real: plain transactions
+    # (which must still produce the exact pre-A2 signing string) and
+    # post-activation op-bearing ones (the user's actual stake/liquidity/
+    # swap history — must verify, but is NOT expected to match the old
+    # signing format: op fields are deliberately part of what gets
+    # signed). This scenario originally asserted no op transaction could
+    # exist on the real chain at all; that stopped being true the day the
+    # fork activated at height 90 and real op transactions were mined.
     signature_mismatches = 0
     validity_failures = 0
     checked_signed = 0
+    checked_op = 0
     for block in candidate:
         for tx in block.transactions:
-            assert tx.op is None, "no real historical transaction should have an op — this run predates A2"
-            if tx.op is not None:  # unreachable given the assert above; documents intent
-                continue
             if tx.sender == "0":
+                continue
+            if tx.op is not None:
+                checked_op += 1
+                if not tx.is_valid():
+                    validity_failures += 1
                 continue
             checked_signed += 1
             if tx.to_signing_string() != old_style_signing_string(tx):
                 signature_mismatches += 1
             if not tx.is_valid():
                 validity_failures += 1
-    print(f"  {checked_signed} real signed transactions: {signature_mismatches} signing-string mismatches, {validity_failures} now-invalid")
+    print(f"  {checked_signed} real plain + {checked_op} real op-bearing signed transactions: "
+          f"{signature_mismatches} signing-string mismatches, {validity_failures} now-invalid")
     assert signature_mismatches == 0, "op=None must reproduce the exact pre-A2 signing string, or every historical signature breaks"
     assert validity_failures == 0, "no historical transaction should have become invalid"
 
-    addresses = {tx.sender for b in candidate for tx in b.transactions} | {tx.recipient for b in candidate for tx in b.transactions}
+    # The old-style scanner predates ops — it reads every transaction as a
+    # plain OCN move of tx.amount, which is simply wrong for op
+    # transactions (their real quantities live in op_data). So this
+    # regression comparison is only meaningful over the chain's PRE-FORK
+    # PREFIX: every block before the first op-bearing one. That still
+    # tests exactly what it was written to test — that op=None accounting
+    # is bit-for-bit unchanged — it just no longer pretends the old
+    # scanner understands transaction types that didn't exist in its era.
+    first_op_height = next(
+        (b.index for b in candidate if any(tx.op is not None for tx in b.transactions)),
+        len(candidate),
+    )
+    prefix = candidate[:first_op_height]
+    addresses = {tx.sender for b in prefix for tx in b.transactions} | {tx.recipient for b in prefix for tx in b.transactions}
     addresses.discard("0")
     balance_mismatches = [
-        (addr, old_style_get_balance(candidate, addr), real_chain_obj.get_balance(addr, chain=candidate))
+        (addr, old_style_get_balance(prefix, addr), real_chain_obj.get_balance(addr, chain=prefix))
         for addr in addresses
     ]
     balance_mismatches = [m for m in balance_mismatches if m[1] != m[2]]
-    print(f"  checked {len(addresses)} addresses' get_balance(chain=...) against the old hand-rolled scan: {len(balance_mismatches)} mismatches")
-    assert not balance_mismatches, f"chain= path must match the old OCN-only scan exactly: {balance_mismatches}"
+    print(f"  checked {len(addresses)} addresses' get_balance(chain=...) against the old hand-rolled scan over the {len(prefix)}-block pre-fork prefix: {len(balance_mismatches)} mismatches")
+    assert not balance_mismatches, f"chain= path must match the old OCN-only scan exactly over pre-fork history: {balance_mismatches}"
 
 
 print("\n=== Scenario 2: op=None transaction signs/verifies exactly as before A2 existed ===")

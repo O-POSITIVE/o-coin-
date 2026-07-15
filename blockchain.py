@@ -666,6 +666,70 @@ class Blockchain:
             "price_b_in_a": (reserve_a / reserve_b) if reserve_b > 0 else None,
         }
 
+    def stake_pool_history(self):
+        """Time series of the liquid-staking pool's state at every block
+        that CHANGED it — replayed from the chain itself (the same
+        _apply_transaction_to_balance_dict math the live index uses), never
+        separately stored, so it's as trustlessly re-derivable as any other
+        read in this file. Read-only analytics for node.py — zero effect on
+        consensus. Snapshots only on change (deposits/withdrawals/rewards
+        landing in the pool), not every block, so the payload stays small
+        no matter how long the chain gets between pool events."""
+        history = []
+        balances, asset_supply = {}, {}
+        pool_ocn_key = (self.STAKE_POOL_ADDRESS, "OCN")
+        # Seeded with the empty-pool state (not None) so the leading run of
+        # blocks from before the pool ever saw activity contributes zero
+        # points instead of one meaningless all-zero snapshot at genesis.
+        last = (0, 0)
+        for block in self.chain:
+            for tx in block.transactions:
+                self._apply_transaction_to_balance_dict(balances, tx, asset_supply)
+            snapshot = (balances.get(pool_ocn_key, 0), asset_supply.get("stOCN", 0))
+            if snapshot != last:
+                last = snapshot
+                history.append({
+                    "height": block.index,
+                    "timestamp": block.timestamp,
+                    "total_staked_ocn": snapshot[0],
+                    "total_stocn_supply": snapshot[1],
+                    "exchange_rate": self._stake_pool_exchange_rate(balances, asset_supply),
+                })
+        return history
+
+    def pool_history(self, pool_key):
+        """Same idea as stake_pool_history, for one AMM pool: reserves/
+        price/LP-supply at every block that changed them, plus that block's
+        swap volume (sum of amount_in across its pool_swap ops for this
+        pool — the number a volume chart wants). Replayed from the chain,
+        read-only, no consensus effect."""
+        self._validate_pool_key(pool_key)
+        asset_a, asset_b = pool_key.split(":")
+        pool_addr = self._pool_address(pool_key)
+        lp_asset = self._lp_asset_id(pool_key)
+        history = []
+        balances, asset_supply = {}, {}
+        last = (0, 0, 0)  # same empty-state seeding as stake_pool_history
+        for block in self.chain:
+            swap_volume = 0
+            for tx in block.transactions:
+                if tx.op == "pool_swap" and (tx.op_data or {}).get("pool_key") == pool_key:
+                    swap_volume += (tx.op_data or {}).get("amount_in", 0)
+                self._apply_transaction_to_balance_dict(balances, tx, asset_supply)
+            snapshot = (balances.get((pool_addr, asset_a), 0), balances.get((pool_addr, asset_b), 0), asset_supply.get(lp_asset, 0))
+            if snapshot != last:
+                last = snapshot
+                reserve_a, reserve_b, lp_supply = snapshot
+                history.append({
+                    "height": block.index,
+                    "timestamp": block.timestamp,
+                    "reserve_a": reserve_a, "reserve_b": reserve_b,
+                    "lp_supply": lp_supply,
+                    "price_a_in_b": (reserve_b / reserve_a) if reserve_a > 0 else None,
+                    "swap_volume_in": swap_volume,
+                })
+        return history
+
     @staticmethod
     def _apply_transaction_to_balance_dict(balances, tx, asset_supply):
         """The one place transaction accounting actually happens, for every

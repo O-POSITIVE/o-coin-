@@ -585,6 +585,45 @@ def amm_pool_status(pool_key):
             return jsonify({"status": "failed", "reason": str(e)}), 400
 
 
+# History replays walk the whole chain — cheap at today's length but not
+# something to redo on every poll of an analytics chart. Cached per chain
+# length: any accepted/replaced block changes len(blockchain.chain), which
+# simply keys a fresh entry (and a reorg that REPLACES history at the same
+# length is impossible to serve stale here, because replace_chain only ever
+# adopts strictly LONGER chains). Tiny dict, pruned to the current length.
+_history_cache = {}
+
+
+def _cached_history(kind, builder):
+    with chain_lock:
+        key = (kind, len(blockchain.chain))
+        if key not in _history_cache:
+            for stale in [k for k in _history_cache if k[0] == kind and k != key]:
+                del _history_cache[stale]
+            _history_cache[key] = builder()
+        return _history_cache[key]
+
+
+@app.route("/stake_pool/history")
+def stake_pool_history():
+    """Read-only time series of the staking pool (rate/staked/supply at
+    every block that changed them) — the data an exchange-rate chart wants.
+    Replayed from the chain itself, so it needs no storage and can't drift
+    from consensus state."""
+    return jsonify({"history": _cached_history("stake", blockchain.stake_pool_history)})
+
+
+@app.route("/pools/<pool_key>/history")
+def amm_pool_history(pool_key):
+    """Read-only time series of one AMM pool (reserves/price/LP supply/
+    per-block swap volume at every block that changed the pool)."""
+    try:
+        history = _cached_history(f"pool:{pool_key}", lambda: blockchain.pool_history(pool_key))
+    except ValueError as e:
+        return jsonify({"status": "failed", "reason": str(e)}), 400
+    return jsonify({"pool_key": pool_key, "history": history})
+
+
 @app.route("/pos/stake")
 def stake_here():
     """Convenience endpoint mirroring /mine: one single kernel-check
