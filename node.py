@@ -35,8 +35,20 @@ Run it:
 import argparse
 import json
 import os
+import re
 import threading
 import time
+
+# Same fix trading-platform's server.py carries: this development machine's
+# network security software intercepts TLS with a certificate that's in the
+# OS trust store but not Python's bundled CA list, so any HTTPS call from a
+# locally-run node (e.g. syncing from a hosted peer via OCOIN_PEERS) fails
+# certificate verification without this. Harmless no-op on Render/Linux.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
 
 import psycopg2
 import psycopg2.extras
@@ -493,7 +505,14 @@ def _resolve_with_peers():
     with chain_lock:
         for peer in list(peers):
             try:
-                resp = requests.get(f"{peer}/chain", headers=headers, timeout=5)
+                # 60s, not the 2-5s the gossip paths use: /chain ships the
+                # peer's ENTIRE chain, and a cloud-hosted peer serving
+                # hundreds of blocks (plus a possible cold start) can
+                # legitimately take longer than a quick status ping. This
+                # call only happens on startup catch-up, explicit
+                # /nodes/resolve, and peer_sync_loop's already-throttled
+                # once-per-2-min check — never in a request hot path.
+                resp = requests.get(f"{peer}/chain", headers=headers, timeout=60)
                 data = resp.json()
                 candidate = [Block.from_dict(b) for b in data["chain"]]
                 if blockchain.replace_chain(candidate):
@@ -509,6 +528,31 @@ def _resolve_with_peers():
 def resolve_conflicts():
     replaced = _resolve_with_peers()
     return jsonify({"status": "ok", "replaced": replaced, "chain_length": len(blockchain.chain)})
+
+
+def peer_sync_loop():
+    """Self-healing reconciliation for env-seeded peers (OCOIN_PEERS) —
+    gossip (broadcast_block) is fire-and-forget, so a peer that was
+    asleep/restarting when a block was pushed would otherwise stay behind
+    until something happened to call /nodes/resolve. This loop closes that
+    gap every 2 minutes, with a cheap /status length check first so the
+    full /chain download (the expensive part, whole chain every time — fine
+    at today's size, revisit with an incremental fetch if the chain gets
+    long) only happens when a peer actually claims a longer chain."""
+    headers = _peer_headers()
+    while True:
+        time.sleep(120)
+        try:
+            for peer in list(peers):
+                try:
+                    resp = requests.get(f"{peer}/status", timeout=30)
+                    if resp.json().get("chain_length", 0) > len(blockchain.chain):
+                        _resolve_with_peers()
+                        break
+                except requests.RequestException:
+                    pass
+        except Exception as e:
+            print("peer_sync_loop tick failed:", e)
 
 
 @app.route("/mine")
@@ -751,8 +795,29 @@ if __name__ == "__main__":
     # feature exists for) would otherwise silently share one chain and
     # appear to sync perfectly without ever actually talking to each other
     # over HTTP at all. Same trick the old per-port SQLite filename played.
-    BLOCKS_TABLE = f"ocoin_blocks_{args.port}"
+    # OCOIN_BLOCKS_TABLE overrides for hosted redundancy: two Render
+    # services share one Supabase database AND both bind the same port
+    # number, so the port-derived name would silently collide — each
+    # service names its own table explicitly instead.
+    BLOCKS_TABLE = os.getenv("OCOIN_BLOCKS_TABLE") or f"ocoin_blocks_{args.port}"
+    if not re.fullmatch(r"[a-z0-9_]+", BLOCKS_TABLE):
+        raise SystemExit(f"OCOIN_BLOCKS_TABLE must be a plain lowercase identifier, got: {BLOCKS_TABLE!r}")
     load_chain()
+    # OCOIN_PEERS: comma-separated peer base URLs, seeded at startup —
+    # /nodes/register still works but only lives in memory, which on a
+    # host that sleeps/redeploys means peers silently un-peer on every
+    # restart. Env-seeded peers survive restarts, an immediate resolve
+    # catches up a fresh/behind node before it starts serving, and
+    # peer_sync_loop keeps reconciling from there.
+    for peer_url in (os.getenv("OCOIN_PEERS") or "").split(","):
+        peer_url = peer_url.strip().rstrip("/")
+        if peer_url:
+            peers.add(peer_url)
+    if peers:
+        print(f"Seeded {len(peers)} peer(s) from OCOIN_PEERS: {sorted(peers)}")
+        if _resolve_with_peers():
+            print(f"Startup resolve adopted a longer peer chain — now at {len(blockchain.chain)} blocks")
+        threading.Thread(target=peer_sync_loop, daemon=True).start()
     # Track A, Phase A6 — test-only override, completely inert unless
     # someone deliberately sets this env var (Render's production
     # environment never does). Lets a LOCAL test node exercise op-bearing
