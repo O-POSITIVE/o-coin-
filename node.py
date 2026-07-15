@@ -604,6 +604,71 @@ def _cached_history(kind, builder):
         return _history_cache[key]
 
 
+# ── Explorer routes — read-only views over the chain for the site's block
+# explorer. Deliberately paginated (newest-first, ?before= cursor) so the
+# payload stays bounded no matter how long the chain gets, unlike /chain
+# (which ships the entire thing and exists for peer sync, not browsing).
+@app.route("/blocks")
+def blocks_page():
+    try:
+        limit = max(1, min(int(request.args.get("limit", 20)), 100))
+        before = request.args.get("before")
+        before = int(before) if before is not None else None
+    except ValueError:
+        return jsonify({"status": "failed", "reason": "limit/before must be integers"}), 400
+    with chain_lock:
+        tip = len(blockchain.chain) - 1
+        end = tip if before is None else min(before - 1, tip)
+        if end < 0:
+            return jsonify({"chain_length": tip + 1, "blocks": []})
+        start = max(0, end - limit + 1)
+        page = blockchain.chain[start:end + 1]
+        payload = [{
+            "index": b.index,
+            "timestamp": b.timestamp,
+            "hash": b.compute_hash(),
+            "staker_address": b.staker_address,  # None -> PoW block
+            "tx_count": len(b.transactions),
+            # Who this block paid: the staker for PoS, else the first
+            # coinbase recipient (solo miner, or a pool's top contributor).
+            "producer": b.staker_address or next((t.recipient for t in b.transactions if t.sender == "0"), None),
+            "coinbase_total": sum(t.amount for t in b.transactions if t.sender == "0"),
+        } for b in reversed(page)]
+        return jsonify({"chain_length": tip + 1, "blocks": payload})
+
+
+@app.route("/blocks/<int:idx>")
+def block_detail(idx):
+    with chain_lock:
+        if idx < 0 or idx >= len(blockchain.chain):
+            return jsonify({"status": "failed", "reason": f"No block at index {idx}"}), 404
+        return jsonify(blockchain.chain[idx].to_dict())
+
+
+@app.route("/address/<address>/transactions")
+def address_transactions(address):
+    """Newest-first transactions touching one address (as sender or
+    recipient). Linear chain walk per request — fine at current chain
+    length; revisit with an index if the chain grows enough to matter
+    (same judgment call as A1's original balance index)."""
+    try:
+        limit = max(1, min(int(request.args.get("limit", 25)), 100))
+    except ValueError:
+        return jsonify({"status": "failed", "reason": "limit must be an integer"}), 400
+    with chain_lock:
+        results = []
+        for b in reversed(blockchain.chain):
+            for tx in b.transactions:
+                if tx.sender == address or tx.recipient == address:
+                    d = tx.to_dict()
+                    d["block_index"] = b.index
+                    d["block_timestamp"] = b.timestamp
+                    results.append(d)
+            if len(results) >= limit:
+                break
+        return jsonify({"address": address, "transactions": results[:limit]})
+
+
 @app.route("/stake_pool/history")
 def stake_pool_history():
     """Read-only time series of the staking pool (rate/staked/supply at
