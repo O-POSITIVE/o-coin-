@@ -23,7 +23,7 @@ is the one piece of the BFT layer a human might want standalone (generate
 a validator identity, check a public key) without pulling in the rest of
 the consensus logic.
 """
-from py_ecc.bls import G2ProofOfPossession as bls
+import bls_backend as bls  # fast native BLS if available, pure-Python py_ecc fallback (same PoP scheme)
 
 
 class BftValidatorKey:

@@ -5,3 +5,8 @@ py_ecc
 psycopg2-binary
 python-dotenv
 truststore
+# BFT layer BLS signatures. py_ecc (above) is the always-available pure-Python
+# fallback; milagro-bls-binding is the fast native (Rust) backend the BFT layer
+# uses when present (~70x faster verify). Optional — bls_backend.py degrades to
+# py_ecc automatically if the native wheel isn't installable on a given Python.
+milagro-bls-binding

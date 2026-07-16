@@ -55,7 +55,7 @@ import hashlib
 import json
 import time
 
-from py_ecc.bls import G2ProofOfPossession as bls
+import bls_backend as bls  # fast native BLS if available, pure-Python py_ecc fallback (same PoP scheme)
 
 from bft_validator import BftValidatorKey
 

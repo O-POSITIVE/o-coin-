@@ -8,7 +8,7 @@ Same standard as test_bft_accountability.py: force the actual mechanism to
 run (mine real blocks, construct real forged/genuine evidence) rather than
 asserting behavior from a description of it.
 """
-from py_ecc.bls import G2ProofOfPossession as bls
+import bls_backend as bls
 
 from blockchain import Blockchain
 from wallet import Wallet

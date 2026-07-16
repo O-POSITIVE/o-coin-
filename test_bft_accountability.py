@@ -21,7 +21,7 @@ break, not just the same-view case, and via the ACTUAL protocol state
 machine (BftReplica.propose/on_receive_proposal/on_receive_vote), not
 hand-waved data structures.
 """
-from py_ecc.bls import G2ProofOfPossession as bls
+import bls_backend as bls
 
 from bft_validator import BftValidatorKey
 from bft_consensus import BftBlock, BftReplica, Vote, Committee, QuorumCertificate, _vote_message
@@ -94,7 +94,7 @@ votes_B = [make_vote(keys[i], i, BLOCK_B, VIEW) for i in (0, 1, 3)]  # byz0, byz
 
 # Confirm this really IS a safety violation: both QCs genuinely verify.
 def qc_from(votes, block_hash):
-    from py_ecc.bls import G2ProofOfPossession as bls
+    import bls_backend as bls
     idxs = sorted(v.voter_index for v in votes)
     agg = bls.Aggregate([bytes.fromhex(v.signature_hex) for v in votes])
     return QuorumCertificate(block_hash, VIEW, idxs, agg.hex())

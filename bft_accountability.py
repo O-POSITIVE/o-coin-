@@ -71,7 +71,7 @@ that already exist.
 Isolated exactly like bft_consensus.py: imports only from the BFT layer,
 nothing from blockchain.py/node.py, and nothing there imports this.
 """
-from py_ecc.bls import G2ProofOfPossession as bls
+import bls_backend as bls  # fast native BLS if available, pure-Python py_ecc fallback (same PoP scheme)
 
 from bft_consensus import Vote, Committee, BftBlock, QuorumCertificate, GENESIS_BLOCK_HASH, _vote_message
 

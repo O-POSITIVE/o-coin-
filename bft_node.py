@@ -197,9 +197,25 @@ class BftNode:
         vote = self.replica.on_receive_proposal(block)
         if vote is not None:
             self._touch()
-            # Votes for view V go to the leader of V+1 (chained-HotStuff
-            # pipelining) — that leader turns 2f+1 of them into QC(V).
-            self._deliver(self.committee.leader_for_view(block.view + 1), "/bft/vote", vote.to_dict())
+            # Vote dissemination — BROADCAST to the whole committee, not just
+            # the next view's leader. The textbook "linear HotStuff"
+            # optimization sends each vote only to the leader of view V+1, who
+            # is the sole node that tallies them into QC(V). That's cheaper
+            # (O(n) messages) but has a real liveness cost: if that one
+            # designated tallier is the crashed/Byzantine node, QC(V) never
+            # forms even though a full honest quorum voted — and under a fixed
+            # round-robin schedule the dead node lands as that tallier often
+            # enough to stall commits entirely (the n=4/f=1 limitation we
+            # hit). Broadcasting votes (O(n^2) messages) means ANY live
+            # replica can assemble the QC the instant it holds 2f+1 votes, so
+            # no single node's death can block finality. on_receive_vote is
+            # already written to form a QC from whatever votes it collects,
+            # so this needs zero change to the consensus core — only where the
+            # vote is addressed. This is the standard robustness/bandwidth
+            # trade PBFT-family protocols make.
+            body_out = vote.to_dict()
+            for idx in self.peers:
+                self._deliver(idx, "/bft/vote", body_out)
 
     def _handle_vote(self, body):
         vote = Vote.from_dict(body)
