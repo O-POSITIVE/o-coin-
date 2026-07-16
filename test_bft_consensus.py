@@ -217,4 +217,40 @@ spoofed_result = leader2.on_receive_new_view(spoofed)
 print(f"  a real message relabeled under a different sender_index being accepted at all (must be False): {spoofed_result}")
 assert spoofed_result is False
 
+print("\n=== Scenario 7: block sync — try_import_block catches a replica up, safely ===")
+# Build a real committed chain on a full committee, then have a FRESH replica
+# (as if just joined / restarted, knowing only genesis) import that chain via
+# try_import_block and prove: (a) it catches up to the same committed history,
+# (b) it never voted while syncing (voted_views stays empty -> importing can't
+# cause equivocation), and (c) a forged block is rejected, not trusted.
+committee7, replicas7 = make_committee_and_replicas()
+chain_blocks = []
+for view in range(1, 9):
+    block, _ = run_honest_view(committee7, replicas7, view, payload=f"sync-cmd-{view}")
+    chain_blocks.append(block)
+reference = max((r.committed for r in replicas7), key=len)
+print(f"  committee committed {len(reference)-1} blocks beyond genesis")
+
+# A brand-new replica that has only genesis.
+newcomer = BftReplica(0, replicas7[0].my_key, committee7)  # identity irrelevant to importing
+assert newcomer.committed == [GENESIS_BLOCK_HASH] and newcomer.voted_views == {}
+imported = sum(1 for b in chain_blocks if newcomer.try_import_block(b))  # oldest-first, as block sync delivers
+print(f"  newcomer imported {imported} blocks; committed now {len(newcomer.committed)-1} beyond genesis")
+assert newcomer.committed == reference[:len(newcomer.committed)], "synced history must be a prefix-consistent match, no fork"
+assert len(newcomer.committed) >= len(reference) - 1, "newcomer must catch essentially all the way up"
+assert newcomer.voted_views == {}, "importing historical blocks must NEVER cast a vote (no equivocation risk)"
+
+# A forged block: real structure, but its justify QC is a genuine QC with a
+# tampered view number, so QC.verify fails -> try_import_block must reject it.
+good = chain_blocks[-1]
+forged_justify = dict(good.justify); forged_justify["view"] = 999
+forged = BftBlock(good.view + 1, good.hash, "forged-payload",
+                  committee7.pubkeys[committee7.leader_for_view(good.view + 1)], justify=forged_justify)
+before = len(newcomer.blocks)
+rejected = newcomer.try_import_block(forged)
+print(f"  forged block accepted (must be False): {rejected}")
+assert rejected is False and len(newcomer.blocks) == before, "a block whose QC doesn't verify must never be imported"
+print("  OK — block sync catches a replica up to the real chain, refuses forged blocks, and never votes while doing so")
+
+
 print("\n=== ALL SCENARIOS PASSED ===")

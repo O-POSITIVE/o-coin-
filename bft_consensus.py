@@ -310,11 +310,11 @@ class BftReplica:
             # missing an ancestor, breaking every future ancestry walk
             # (_extends, the 3-chain commit check) for this replica.
             # Caught via real multi-replica testing, not theoretical: a
-            # skipped-leader scenario reproduced this exact gap. The
-            # correct real fix is a block-sync/catch-up step (fetch
-            # missing ancestors from peers before voting) — real, needed,
-            # unbuilt future work; refusing to vote here is the safe
-            # fallback until that exists, not a permanent design choice.
+            # skipped-leader scenario reproduced this exact gap. Refusing to
+            # vote here is the safe fallback; the real fix is a block-sync/
+            # catch-up step (fetch the missing ancestors from peers, then
+            # re-deliver this proposal) — now built: try_import_block below
+            # is the ingestion primitive, driven by bft_node.py's sync path.
             return None
 
         justify_qc = QuorumCertificate.from_dict(block.justify)
@@ -331,6 +331,42 @@ class BftReplica:
         signature = self.my_key.sign(_vote_message(block.hash, block.view))
         self.voted_views[block.view] = block.hash
         return Vote(block.hash, block.view, self.my_index, signature.hex())
+
+    def try_import_block(self, block: BftBlock) -> bool:
+        """Ingest a block learned via BLOCK-SYNC — a historical block this
+        replica missed (it fell behind, or restarted), NOT a live proposal
+        to vote on. This is the catch-up primitive the block-sync path
+        (bft_node.py) drives: fetch a missing ancestor chain from peers,
+        then import it oldest-first so this replica's block tree and commit
+        state are made whole and it can rejoin.
+
+        Validates a block exactly as far as accepting an ALREADY-CERTIFIED
+        block requires — the same justify-QC and rightful-proposer checks
+        on_receive_proposal does — but deliberately NOT the vote-only parts:
+          - no current_view gate (synced blocks are historical, from views
+            long past),
+          - never signs a vote and never touches voted_views, so importing
+            can NEVER cause equivocation (the one safety-critical thing a
+            replica must never do). Committing off a valid 3-chain is safe
+            no matter how the blocks arrived; only *voting* twice isn't.
+        Requires the parent already present (caller syncs ancestors oldest-
+        first). Returns True if imported or already known, False if the
+        block fails validation (e.g. a peer served a forged/garbage block)."""
+        if block.hash in self.blocks:
+            return True
+        if block.parent_hash not in self.blocks:
+            return False  # ancestors must be synced first, oldest-first
+        proposer_idx = self.committee.index_of(block.proposer_pubkey_hex)
+        if proposer_idx is None or self.committee.leader_for_view(block.view) != proposer_idx:
+            return False
+        justify_qc = QuorumCertificate.from_dict(block.justify)
+        if justify_qc is None or justify_qc.block_hash != block.parent_hash:
+            return False
+        if justify_qc.block_hash != GENESIS_BLOCK_HASH and not justify_qc.verify(self.committee):
+            return False
+        self.blocks[block.hash] = block
+        self._apply_qc(justify_qc)
+        return True
 
     def _apply_qc(self, qc: QuorumCertificate):
         """Shared handling for 'this replica has now seen strong (2f+1)

@@ -37,7 +37,11 @@ def _get_status(url):
         return json.loads(resp.read().decode())
 
 
-def build_cluster(n=N, view_timeout=2.0):
+def build_cluster(n=N, view_timeout=2.0, deferred=()):
+    """Build n nodes. Every node's intended (host, port) is stashed on
+    node.host_port; nodes whose index is in `deferred` are created but NOT
+    started (the test starts them later via node.start(*node.host_port), to
+    simulate a late-joining / restarted validator)."""
     keys = [BftValidatorKey() for _ in range(n)]
     committee = Committee([k.public_key_hex() for k in keys])
     ports = [_free_port() for _ in range(n)]
@@ -45,10 +49,14 @@ def build_cluster(n=N, view_timeout=2.0):
     nodes = [BftNode(i, keys[i], committee, peers, view_timeout_seconds=view_timeout, tick_seconds=0.2)
              for i in range(n)]
     for i, node in enumerate(nodes):
-        node.start("127.0.0.1", ports[i])
-    # Wait until every server is actually accepting connections.
+        node.host_port = ("127.0.0.1", ports[i])
+        if i not in deferred:
+            node.start("127.0.0.1", ports[i])
+    # Wait until every STARTED server is actually accepting connections.
     deadline = time.time() + 10
     for i in range(n):
+        if i in deferred:
+            continue
         while time.time() < deadline:
             try:
                 _get_status(peers[i]); break
@@ -160,5 +168,53 @@ finally:
     for i in present:
         nodes[i].stop()
     time.sleep(0.5)
+
+print("\n=== Scenario 4: block sync — a late-joining node catches up and rejoins ===")
+# Node 3 is DEFERRED (its server never starts at first). Nodes 0,1,2 are
+# exactly a quorum (2f+1 = 3), so they commit a real chain WITHOUT node 3,
+# which stays frozen at genesis. Then node 3 is started cold: the first live
+# proposal it receives references a parent deep in a chain it has never seen.
+# Without block sync it would refuse to vote forever (missing-parent guard)
+# and stay stuck. With it, node 3 fetches the missing ancestor chain from a
+# peer, imports it (try_import_block validates each block's QC before
+# trusting it), catches its committed state up to the others, and then votes
+# on subsequent proposals — a genuine rejoin, proven over real HTTP.
+keys, committee, peers, nodes = build_cluster(view_timeout=2.0, deferred={3})
+try:
+    # Let the 3-node quorum commit a few blocks while node 3 is absent.
+    quorum = [0, 1, 2]
+    early = wait_for_commits(peers, quorum, min_commits=3, timeout=60)
+    for i in quorum:
+        print(f"  (pre-join) node {i}: committed={early[i]['committed_count']-1} beyond genesis")
+    assert all(early[i]["committed_count"] >= 4 for i in quorum), "the quorum must commit real blocks while node 3 is away"
+
+    # Now bring node 3 online cold (fresh at genesis) and let it catch up.
+    nodes[3].start(*nodes[3].host_port)
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        try:
+            s3 = _get_status(peers[3])
+            if s3["committed_count"] >= 4:
+                break
+        except Exception:
+            pass
+        time.sleep(0.25)
+
+    final = {i: _get_status(peers[i]) for i in range(N)}
+    for i in range(N):
+        print(f"  node {i}: view={final[i]['current_view']} committed={final[i]['committed_count']-1} beyond genesis")
+    assert final[3]["committed_count"] >= 4, \
+        "the late-joining node must catch up to a real committed chain via block sync"
+    # And what it caught up to must MATCH the others — sync can't invent a fork.
+    assert_consistent(final)
+    shortest = min(final[i]["committed_count"] for i in range(N))
+    ref = final[0]["committed"][:shortest]
+    assert final[3]["committed"][:shortest] == ref, "the synced node's chain must be identical to the committee's"
+    print(f"  OK — node 3 joined cold, synced {final[3]['committed_count']-1} committed blocks, and matches the committee exactly")
+finally:
+    for node in nodes:
+        node.stop()
+    time.sleep(0.5)
+
 
 print("\n=== ALL BFT NODE (HTTP) SCENARIOS PASSED ===")

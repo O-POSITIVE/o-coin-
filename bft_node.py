@@ -40,12 +40,14 @@ integration decision that this file does not make or assume.
 WHAT'S PROVEN vs. NOT: test_bft_node.py spins up a real committee of these
 nodes on localhost, over real HTTP, and asserts they all commit the SAME
 chain — the network analog of the in-process safety tests, and of the
-chain's own multi-node HTTP test. Known unbuilt gaps, all inherited from
-bft_consensus.py's own documented TODOs, NOT newly introduced here:
-block-sync/catch-up for a replica missing an ancestor (a replica behind on
-history refuses to vote rather than voting into a gap — the safe fallback
-already documented in on_receive_proposal), and live committee
-reconfiguration. This layer does not pretend to solve either.
+chain's own multi-node HTTP test. It also proves BLOCK SYNC: a node started
+cold, long after the others have committed, fetches the missing history from
+a peer, catches up, and rejoins (Scenario 4) — closing the missing-ancestor
+gap on_receive_proposal used to document as unbuilt. The remaining known gap
+(inherited from bft_consensus.py's own TODOs, NOT introduced here) is live
+committee reconfiguration — changing the validator set mid-run; this layer
+assumes a fixed committee for the duration of a run and does not pretend to
+solve that.
 """
 import argparse
 import queue
@@ -58,7 +60,7 @@ from flask import Flask, jsonify, request
 
 from bft_validator import BftValidatorKey
 from bft_consensus import (
-    BftReplica, BftBlock, Vote, NewViewMsg, Committee, QuorumCertificate,
+    BftReplica, BftBlock, Vote, NewViewMsg, Committee, QuorumCertificate, GENESIS_BLOCK_HASH,
 )
 
 
@@ -95,6 +97,7 @@ class BftNode:
         self._max_backoff_mult = 8
         self._consec_timeouts = 0
         self._view_deadline = time.time() + self._base_timeout
+        self._sync_in_flight = False  # at most one block-sync fetch outstanding at a time
         self._running = False
         self._senders = ThreadPoolExecutor(max_workers=max(4, len(peers)))
         self._worker = None
@@ -194,6 +197,14 @@ class BftNode:
             # actually vote). No NewView emission here: the proposal already
             # carries everyone forward.
             self._sync_to_view(block.view)
+        # BLOCK SYNC: if we're missing this proposal's parent, we've fallen
+        # behind (or just joined). on_receive_proposal would refuse to vote
+        # and we'd be stuck forever. Instead fetch the missing ancestor chain
+        # from a peer, import it, and re-deliver this same proposal to
+        # ourselves so we can then vote on it normally.
+        if block.parent_hash not in self.replica.blocks:
+            self._request_sync(block.parent_hash, body)
+            return
         vote = self.replica.on_receive_proposal(block)
         if vote is not None:
             self._touch()
@@ -252,11 +263,59 @@ class BftNode:
         self._view_deadline = now + self._base_timeout * mult
         self._emit_new_view()
 
+    # ── block sync (catch-up for a lagging / restarted replica) ──────
+    def _request_sync(self, missing_hash, retry_proposal_body):
+        """Kick off a background fetch of the ancestor chain ending at
+        missing_hash. Runs the network I/O on the sender pool (never blocks
+        the consumer), then feeds the fetched blocks and a re-delivery of the
+        stalled proposal back through the inbox so they're applied on the
+        single consumer thread. At most one fetch runs at a time; extra
+        proposals that arrive mid-sync are simply dropped — more will come,
+        and HotStuff already tolerates message loss."""
+        if self._sync_in_flight:
+            return
+        self._sync_in_flight = True
+        self._senders.submit(self._do_sync, missing_hash, retry_proposal_body)
+
+    def _do_sync(self, tip_hash, retry_proposal_body):
+        blocks = None
+        for idx, url in self.peers.items():
+            if idx == self.my_index:
+                continue
+            try:
+                resp = requests.get(url + f"/bft/sync/{tip_hash}", timeout=3.0)
+                data = resp.json()
+            except (requests.RequestException, ValueError):
+                continue
+            if data.get("blocks"):
+                blocks = data["blocks"]
+                break
+        # Enqueue results for the consumer thread: import the ancestors
+        # (oldest-first), then clear the in-flight flag and re-deliver the
+        # proposal that stalled so it can now be voted on.
+        if blocks:
+            for b in blocks:
+                self.inbox.put({"kind": "import_block", "body": b})
+        self.inbox.put({"kind": "sync_done", "body": retry_proposal_body})
+
+    def _handle_import_block(self, body):
+        # try_import_block validates the block (justify QC + rightful
+        # proposer) before trusting it, so a peer serving forged/garbage
+        # blocks can't corrupt our state — it just returns False.
+        self.replica.try_import_block(BftBlock.from_dict(body))
+
+    def _handle_sync_done(self, retry_proposal_body):
+        self._sync_in_flight = False
+        if retry_proposal_body is not None:
+            self.inbox.put({"kind": "proposal", "body": retry_proposal_body})
+
     def _consume(self):
         dispatch = {
             "proposal": self._handle_proposal,
             "vote": self._handle_vote,
             "new_view": self._handle_new_view,
+            "import_block": self._handle_import_block,
+            "sync_done": self._handle_sync_done,
         }
         while self._running:
             try:
@@ -294,6 +353,29 @@ class BftNode:
         def _new_view():
             self.inbox.put({"kind": "new_view", "body": request.get_json(force=True)})
             return jsonify(ok=True)
+
+        @app.get("/bft/sync/<tip_hash>")
+        def _sync(tip_hash):
+            # Serve the chain of stored blocks from tip_hash back to (but not
+            # including) genesis, oldest-first — everything a lagging peer
+            # needs to import up to tip_hash. Read-only walk via parent_hash
+            # lookups (no dict iteration), safe against the consumer thread's
+            # concurrent inserts. Returns an empty list if we don't have
+            # tip_hash either (the requester will try another peer).
+            # SIMPLIFICATION: always walks to genesis rather than to a
+            # caller-supplied "have" frontier; fine for correctness (the
+            # requester skips blocks it already holds) — a production version
+            # would take a `have` hash to bound the response.
+            blocks = self.replica.blocks
+            chain = []
+            h = tip_hash
+            steps = 0
+            while h in blocks and h != GENESIS_BLOCK_HASH and steps < 1_000_000:
+                chain.append(blocks[h].to_dict())
+                h = blocks[h].parent_hash
+                steps += 1
+            chain.reverse()  # oldest-first, ready to import in order
+            return jsonify(blocks=chain)
 
         @app.get("/bft/status")
         def _status():
