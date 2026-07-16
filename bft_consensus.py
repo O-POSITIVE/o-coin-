@@ -51,11 +51,35 @@ HotStuff paper's description, not copied from a reference implementation
 test_bft_consensus.py (a forced fork attempt, verifying the safety rule
 actually blocks it) rather than on trusting memory of the paper alone.
 """
+import functools
 import hashlib
 import json
 import time
 
 import bls_backend as bls  # fast native BLS if available, pure-Python py_ecc fallback (same PoP scheme)
+
+
+@functools.lru_cache(maxsize=8192)
+def _cached_fast_aggregate_verify(pubkeys_tuple, block_hash, view, signer_indices, agg_signature_hex):
+    """Memoized aggregate-signature check — the single most-repeated
+    expensive op in the protocol (the SAME QC is verified again every time
+    it reappears: embedded in a child's justify, re-seen during block sync,
+    carried in a NewView). The result is a pure, deterministic function of
+    exactly these inputs, so caching it is always sound. Crucially the key
+    includes the aggregate SIGNATURE and the exact signer set, so a forged
+    or altered QC (any different signature/signers) is a cache MISS and gets
+    really verified — a forgery can never inherit a genuine QC's cached
+    True. Structural checks (quorum size, no duplicate signers) stay in
+    QuorumCertificate.verify, outside the cache."""
+    try:
+        pks = [bytes.fromhex(pubkeys_tuple[i]) for i in signer_indices]
+        sig = bytes.fromhex(agg_signature_hex)
+    except (IndexError, ValueError, TypeError):
+        return False
+    try:
+        return bls.FastAggregateVerify(pks, _vote_message(block_hash, view), sig)
+    except Exception:
+        return False
 
 from bft_validator import BftValidatorKey
 
@@ -151,16 +175,12 @@ class QuorumCertificate:
             return False
         if len(set(self.signer_indices)) != len(self.signer_indices):
             return False  # no double-counting the same validator toward quorum
-        try:
-            pks = [bytes.fromhex(committee.pubkeys[i]) for i in self.signer_indices]
-            sig = bytes.fromhex(self.agg_signature_hex)
-        except (IndexError, ValueError, TypeError):
-            return False
-        message = _vote_message(self.block_hash, self.view)
-        try:
-            return bls.FastAggregateVerify(pks, message, sig)
-        except Exception:
-            return False
+        # Expensive aggregate check is memoized (see _cached_fast_aggregate_verify);
+        # the signature+signers are part of the key, so forgeries never hit.
+        return _cached_fast_aggregate_verify(
+            tuple(committee.pubkeys), self.block_hash, self.view,
+            tuple(self.signer_indices), self.agg_signature_hex,
+        )
 
 
 class Vote:
