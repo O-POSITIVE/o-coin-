@@ -1,8 +1,7 @@
 """Tests for the additive BFT finality gadget (bft_finality.py) and its
-inert-by-default reorg veto — which lives in a FinalityAwareBlockchain
-SUBCLASS, so blockchain.py itself is untouched ("prepared, not wired").
-Proves the three claims that matter for the 'additive, not a replacement'
-decision:
+inert-by-default reorg veto, now ATTACHED in Blockchain proper (dormant
+until a committee finalizes something). Proves the claims that matter for
+the 'additive, not a replacement' decision:
 
   1. INERT BY DEFAULT — with no finalization, every reorg check behaves
      byte-for-byte as the depth-checkpoint-only chain always has.
@@ -17,11 +16,12 @@ Uses a real local Blockchain() with real scrypt-PoW-mined blocks.
 """
 import copy
 
-from bft_finality import BftFinalityGadget, FinalityAwareBlockchain, make_finality_committee
+from blockchain import Blockchain
+from bft_finality import BftFinalityGadget, make_finality_committee
 
 
 def mined_chain(n_blocks, miner="f" * 40):
-    chain = FinalityAwareBlockchain()
+    chain = Blockchain()
     for _ in range(n_blocks):
         chain.mine_block(miner)
     return chain
@@ -98,5 +98,25 @@ honest_extension = list(chain.chain) + [chain.chain[-1]]
 assert chain._conflicts_with_bft_finality(honest_extension) is False, \
     "a candidate that agrees with all finalized checkpoints must pass the finality veto"
 print("  OK — honest extensions that respect finalized checkpoints are never vetoed")
+
+print("\n=== Scenario 5: DORMANT on the live path — a real reorg still works untouched ===")
+# The production state: a Blockchain that never runs the gadget. A genuinely
+# longer, valid competing chain must still replace ours exactly as before —
+# proving the attached-but-dormant hook changes nothing when unused.
+base = Blockchain()
+for _ in range(3):
+    base.mine_block("a" * 40)
+assert base.bft_finalized == {}, "live chain never touched by the gadget => empty finalized set"
+
+# Build a real, valid, strictly-longer competing chain from a fork of block 1.
+rival = Blockchain()
+rival.chain = list(base.chain[:2])  # share genesis + block 1
+rival._rebuild_balance_index()
+for _ in range(3):  # now mine it longer than base (2 -> 5 vs base's 4)
+    rival.mine_block("b" * 40)
+assert len(rival.chain) > len(base.chain)
+replaced = base.replace_chain(rival.chain)
+assert replaced is True, "with no finalization, a longer valid chain must replace ours exactly as before"
+print(f"  OK — dormant hook is invisible: longer valid chain replaced ours ({replaced}); reorg path unchanged")
 
 print("\n=== ALL FINALITY-GADGET SCENARIOS PASSED ===")

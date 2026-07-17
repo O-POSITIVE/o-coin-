@@ -26,67 +26,27 @@ WHY THIS IS ADDITIVE, NOT A REPLACEMENT — the whole point:
     empty finalized set every reorg check behaves EXACTLY as the
     depth-checkpoint-only chain always has (proven in test_bft_finality.py).
 
-PREPARED, NOT WIRED: blockchain.py itself is UNTOUCHED. The reorg veto that
-enforces finality lives here, in a FinalityAwareBlockchain SUBCLASS, so the
-real consensus file stays pristine and nothing ships to production. Actually
-"wiring" this later = merging FinalityAwareBlockchain's small hook into
-Blockchain proper (plus a real committee across machines, an activation
-height, and persistence of the finalized set) — a deliberate, reviewed
-go/no-go step, never a side effect of importing this file. A finality gadget
-DOES, unavoidably, have to touch the reorg decision to be able to veto a
-rewrite of a finalized block — that's inherent to what finality is — but
-keeping it in a subclass means it touches ONLY a copy, until you choose
-otherwise.
+ATTACHED BUT DORMANT: the reorg veto now lives in Blockchain proper
+(blockchain.py: mark_bft_finalized / _conflicts_with_bft_finality / the
+replace_chain check), so the attachment is real and wired. It is INERT
+because nothing runs a committee against the live chain yet — Blockchain
+.bft_finalized stays empty until this gadget is deliberately pointed at the
+production chain with a chosen committee. Turning it ON = choosing a real
+cross-machine committee (ideally >=4 validators) and running this gadget's
+finalize loop against the live node; that activation step is intentionally
+NOT wired into node.py.
 
-ISOLATION: imports blockchain (subclassing Blockchain) and bft_consensus/
-bft_validator. NOT imported by blockchain.py or node.py. Exercised against a
-LOCAL FinalityAwareBlockchain() only.
+A finality gadget UNAVOIDABLY has to touch the reorg decision to veto a
+rewrite of a finalized block — that's inherent to what finality is — but the
+touch is minimal, additive, and dormant-by-default (empty finalized set =>
+identical behavior to before).
+
+ISOLATION: imports blockchain (uses the now-built hook) and bft_consensus/
+bft_validator. NOT imported by blockchain.py or node.py.
 """
 from bft_consensus import BftReplica, Committee
 from bft_validator import BftValidatorKey
 from blockchain import Blockchain
-
-
-class FinalityAwareBlockchain(Blockchain):
-    """A Blockchain that ADDS BFT-finality reorg protection without editing
-    blockchain.py. Everything about block production — mining, staking,
-    rewards, emission, the depth checkpoint — is inherited UNCHANGED. The
-    only addition is a veto that refuses to reorg away a BFT-finalized block.
-    Inert until the gadget finalizes something (bft_finalized starts empty),
-    so with no finalization this behaves identically to a plain Blockchain."""
-
-    def __init__(self):
-        super().__init__()
-        self.bft_finalized = {}  # index -> block hash the BFT gadget finalized
-
-    def mark_bft_finalized(self, index, block_hash):
-        """Record that the BFT committee finalized the block at `index`.
-        Only accepts a hash matching our OWN block there (can't finalize a
-        block we don't hold), so a bad call can't poison the veto. Idempotent."""
-        if 0 <= index < len(self.chain) and self.chain[index].compute_hash() == block_hash:
-            self.bft_finalized[index] = block_hash
-            return True
-        return False
-
-    def _conflicts_with_bft_finality(self, candidate_chain):
-        """True if candidate_chain would DROP or REWRITE a finalized block —
-        the cryptographic counterpart to the base class's depth-based
-        _diverges_before_checkpoint, and strictly stronger. Empty finalized
-        set => always False => zero behavior change."""
-        for index, block_hash in self.bft_finalized.items():
-            if index >= len(candidate_chain):
-                return True  # can't drop a finalized block
-            if candidate_chain[index].compute_hash() != block_hash:
-                return True  # can't rewrite a finalized block
-        return False
-
-    def replace_chain(self, candidate_chain):
-        """Adds the finality veto in front of the inherited reorg rule, then
-        defers ENTIRELY to the base class. PoW/PoS still decides everything;
-        this only ever ADDS a reason to reject a rewrite of finalized history."""
-        if self.bft_finalized and self._conflicts_with_bft_finality(candidate_chain):
-            return False
-        return super().replace_chain(candidate_chain)
 
 
 def make_finality_committee(n=4):

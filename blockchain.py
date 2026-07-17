@@ -372,6 +372,18 @@ class Blockchain:
         self.mempool = []  # list[Transaction] waiting to be mined
         self.current_target = self.INITIAL_TARGET
         self.pos_target = 2 ** 256 // (self.TARGET_BLOCK_TIME * max(1, self.GENESIS_PREMINE_AMOUNT))
+        # ── BFT finality attachment (DORMANT) ──────────────────────────
+        # index -> block hash the BFT finality gadget (bft_finality.py) has
+        # cryptographically finalized. This is the ADDITIVE finality layer's
+        # one and only reach into consensus: a veto against reorging away a
+        # finalized block (see _conflicts_with_bft_finality + replace_chain).
+        # It is INERT until a BFT committee actually finalizes something —
+        # and nothing here or in node.py runs that committee yet (activation
+        # waits on choosing a real cross-machine committee). While this dict
+        # stays empty, every reorg decision behaves EXACTLY as it always has;
+        # block production, rewards, emission, PoW/PoS are untouched. Same
+        # dormant-until-activated shape as the TX_SCHEMA hard fork.
+        self.bft_finalized = {}
         self._create_genesis_block()
         self._rebuild_balance_index()
 
@@ -1450,17 +1462,52 @@ class Blockchain:
                 return True
         return False
 
+    def mark_bft_finalized(self, index, block_hash):
+        """Called ONLY by the BFT finality gadget (bft_finality.py) when its
+        committee has committed a checkpoint — records that the block at
+        `index` is now cryptographically final. Only accepts a hash that
+        matches our OWN block at that index (you can't finalize a block you
+        don't hold), so a bad or malicious call can never poison the reorg
+        veto. Idempotent. DORMANT: nothing in this file or node.py calls it
+        until a real committee is wired in, so self.bft_finalized stays empty
+        and the veto below never fires."""
+        if 0 <= index < len(self.chain) and self.chain[index].compute_hash() == block_hash:
+            self.bft_finalized[index] = block_hash
+            return True
+        return False
+
+    def _conflicts_with_bft_finality(self, candidate_chain):
+        """True if candidate_chain would DROP or REWRITE any block the BFT
+        gadget has finalized — the cryptographic counterpart to the
+        depth-based _diverges_before_checkpoint, and strictly stronger (a
+        block can be BFT-final long before it is CHECKPOINT_DEPTH deep).
+        Empty finalized set (the default, and the current live state) =>
+        always False => zero behavior change. This one method is the entire
+        'additive, not a replacement' contract: PoW/PoS still decides which
+        chain wins; this only ever ADDS a veto on rewriting finalized
+        history."""
+        for index, block_hash in self.bft_finalized.items():
+            if index >= len(candidate_chain):
+                return True  # can't drop a finalized block
+            if candidate_chain[index].compute_hash() != block_hash:
+                return True  # can't rewrite a finalized block
+        return False
+
     def replace_chain(self, candidate_chain):
         """The 'longest valid chain wins' consensus rule every PoW chain
         uses to resolve disagreement between nodes — EXCEPT past the
         checkpoint boundary, where "longest and valid" is no longer
-        enough; it also has to agree with what we've already checkpointed.
+        enough; it also has to agree with what we've already checkpointed
+        (the depth checkpoint always, plus — once the BFT finality gadget is
+        active — any cryptographically-finalized block).
         Returns True if the candidate replaced our chain, False if it was
         rejected (shorter, invalid, or attempting to rewrite checkpointed
-        history)."""
+        or BFT-finalized history)."""
         if len(candidate_chain) <= len(self.chain):
             return False
         if self._diverges_before_checkpoint(candidate_chain):
+            return False
+        if self.bft_finalized and self._conflicts_with_bft_finality(candidate_chain):
             return False
         if not self.is_chain_valid(candidate_chain):
             return False
