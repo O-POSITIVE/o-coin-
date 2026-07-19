@@ -29,3 +29,17 @@ check_wallet.py
 *KEY*.txt
 *WALLET*INFO*.txt
 FAUCET_WALLET_README.md
+
+# Personal notes / raw chat logs / genesis records — may reference addresses
+# or key material; keep out of the public repo.
+*Genesis Block*.txt
+*chat with claude*.txt
+VPN CORE CONCEPT*.txt
+
+# Local wallet-recovery helper (scans your key files locally) + its launcher.
+find_wallet_key.py
+Find My Wallet Key.bat
+
+# Local, throwaway analysis scripts.
+sim_distribution_models.py
+archive/

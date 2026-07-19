@@ -32,19 +32,24 @@ This is the same keyless construction the staking and AMM pool addresses use
 
 ## Transaction
 
-- **Amount burned:** 5,000,000,000 OCN
-- **From (genesis premine address):** `3b770ab425c217f6615442fcc0517ad8445cf4ba`
+- **Amount burned:** 4,999,100,700 OCN
+- **From (premine address):** `3b770ab425c217f6615442fcc0517ad8445cf4ba`
 - **To (burn address):** `500690f39f2bb75e1c740c58c0409dbaa85103ee`
-- **Burn transaction hash:** _(to be filled in once the burn transaction
-  confirms — paste the `transaction_hash` returned by `send_ocoin.py`, and the
-  block height it confirms in, here)_
+- **Burn transaction hash:** `16aba080581f5f62bf99a77859dd906f1208f7c8c2b14afc7753882991884514`
 
-Only the 5,000,000,000 premine is burned. Any OCN the same wallet earned
-afterward through ordinary PoW mining is not part of the premine and is left
-untouched.
+### Accounting note
+
+The genesis block minted a 5,000,000,000 OCN premine. By the time of the burn
+the premine wallet held **4,999,101,449.41 OCN** — the small difference from
+5,000,000,000 had already been dispersed through ordinary chain activity
+(faucet funding, staking/AMM pool operations that were later unwound, etc.),
+not retained. Of that, **4,999,100,700 OCN** was burned in the transaction
+above, leaving roughly **749 OCN** of dust in the wallet (plus the 0.01 OCN
+network fee). The founder wallet is thereby emptied of its premine.
 
 ## Verifying the burn
 
-Once confirmed, anyone can verify the premine is gone by checking that the burn
-address holds 5,000,000,000 OCN and the original premine address no longer does,
-via the node's balance endpoint or the block explorer.
+Anyone can verify by checking, via the node's balance endpoint or the block
+explorer, that the burn address `500690f3…85103ee` now holds ~4.999 billion OCN
+and the former premine wallet `3b770ab…5cf4ba` holds only dust. Because the burn
+address is provably keyless (see above), those coins can never move again.
