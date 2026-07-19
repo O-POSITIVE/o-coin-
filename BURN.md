@@ -36,6 +36,8 @@ This is the same keyless construction the staking and AMM pool addresses use
 - **From (premine address):** `3b770ab425c217f6615442fcc0517ad8445cf4ba`
 - **To (burn address):** `500690f39f2bb75e1c740c58c0409dbaa85103ee`
 - **Burn transaction hash:** `16aba080581f5f62bf99a77859dd906f1208f7c8c2b14afc7753882991884514`
+- **Confirmed in block:** #1173 (verified on-chain: burn address holds
+  4,999,100,700 OCN; premine wallet emptied to dust). **Final and irreversible.**
 
 ### Accounting note
 
