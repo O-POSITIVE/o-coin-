@@ -37,7 +37,10 @@ wallet = Wallet(private_key_hex=private_key_hex)
 print(f"Sending from address: {wallet.address}")
 
 recipient = input("Recipient address: ").strip()
-amount = float(input("Amount to send: ").strip())
+# Tolerate commas/underscores/spaces in the typed amount (e.g. "4,999,101,449")
+# so a thousands-separated number doesn't crash with a ValueError.
+_raw_amount = input("Amount to send: ").strip().replace(",", "").replace("_", "").replace(" ", "")
+amount = float(_raw_amount)
 
 tx = Transaction(wallet.address, recipient, amount)
 tx.sign(wallet)
