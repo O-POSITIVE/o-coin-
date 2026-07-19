@@ -22,8 +22,10 @@ miner_addr.txt
 # remembering not to `git add -A` over a file containing a real secret.
 Start Mining.bat
 Check My Wallet.bat
+Send O-Coin.bat
 check_wallet.py
 
 # Personal key/wallet notes — never commit private key material.
 *KEY*.txt
 *WALLET*INFO*.txt
+FAUCET_WALLET_README.md
