@@ -949,8 +949,18 @@ if __name__ == "__main__":
             peers.add(peer_url)
     if peers:
         print(f"Seeded {len(peers)} peer(s) from OCOIN_PEERS: {sorted(peers)}")
-        if _resolve_with_peers():
-            print(f"Startup resolve adopted a longer peer chain — now at {len(blockchain.chain)} blocks")
+        # Startup peer-sync is BEST-EFFORT and must never be fatal: this node
+        # already loaded its own persisted chain above, and peer_sync_loop will
+        # keep reconciling once it's serving. A boot-time resolve failure (a
+        # peer down, gated, mid-redeploy, or returning anything unexpected)
+        # must not stop this node from coming up — otherwise two nodes can
+        # deadlock each other on restart. Belt-and-suspenders around the
+        # per-peer guards already inside _resolve_with_peers.
+        try:
+            if _resolve_with_peers():
+                print(f"Startup resolve adopted a longer peer chain — now at {len(blockchain.chain)} blocks")
+        except Exception as e:
+            print(f"Startup peer resolve failed (non-fatal, continuing): {e}")
         threading.Thread(target=peer_sync_loop, daemon=True).start()
     # Track A, Phase A6 — test-only override, completely inert unless
     # someone deliberately sets this env var (Render's production

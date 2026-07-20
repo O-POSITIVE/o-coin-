@@ -80,6 +80,14 @@ so keeping them gated costs participants nothing.
   can now run a node that fully SYNCS from the live network and mine it.*
   (Full `/chain` pagination for very large chains remains a later optimization;
   the cache handles today's scale.)
+  **LIVE + VERIFIED IN PRODUCTION 2026-07-20:** both hosted nodes serve
+  `/chain` publicly (200, no secret), heights tracking within ±1. Shipping it
+  surfaced a pre-existing latent bug — `_resolve_with_peers` crashed the node
+  on boot if a peer's `/chain` returned a non-chain body (a 401 from the
+  post-rotation secret mismatch); fixed to skip bad peers, plus the whole
+  startup resolve is now wrapped so it can never be fatal (a node always has
+  its own persisted chain). This is exactly why each phase deploys and gets
+  verified in production before the next.
 - **D2 — Open the gossip (add the guards first).** Add `flask-limiter` + the
   mempool cap, then make `/transactions/new`, `/blocks/receive`,
   `/nodes/resolve`, `/nodes/register` public. *Now independent nodes fully
