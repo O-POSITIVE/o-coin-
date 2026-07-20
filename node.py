@@ -106,6 +106,17 @@ BLOCKS_TABLE = None  # set from --port in __main__; see init_db()/save_block()/l
 # intent. Optional (only enforced if the env var is set) so local dev/testing
 # is unaffected.
 NODE_SHARED_SECRET = os.getenv("OCOIN_NODE_SHARED_SECRET")
+# Decentralization phase D3. /mine (in-process PoW search) and /pos/stake
+# (manual single stake attempt) run heavy work inside the node's own process —
+# a CPU-DoS lever on a public node, and real mining/staking never need them
+# (use /mining/template + miner.py, and node.py --stake). They are now OFF by
+# default and return 403; set OCOIN_ENABLE_LOCAL_MINE=true only on a local/dev
+# node that deliberately wants them. This retires the last thing the shared
+# secret meaningfully guarded on the node — after D1/D2, sync/gossip/reads are
+# all public, so the secret's remaining job was gating exactly these two
+# conveniences; disabling them by default makes the node safe even if the
+# secret is unset or shared.
+LOCAL_MINE_ENABLED = os.getenv("OCOIN_ENABLE_LOCAL_MINE", "").strip().lower() in ("1", "true", "yes", "on")
 # /status: left open for an external keep-alive pinger; no sensitive data.
 # /mining/template, /mining/submit: opened deliberately (2026-07-11) so
 # anyone running the public miner.py download can actually reach the
@@ -644,6 +655,8 @@ def mine_here():
     testing and for a node with no separate miner attached — real/serious
     mining should go through /mining/template + miner.py instead, which
     doesn't block the node's own HTTP responsiveness while searching."""
+    if not LOCAL_MINE_ENABLED:
+        return jsonify({"status": "failed", "reason": "/mine is disabled on this node. Real mining uses /mining/template + miner.py; set OCOIN_ENABLE_LOCAL_MINE=true only for local dev."}), 403
     miner_address = request.args.get("miner_address")
     if not miner_address:
         return jsonify({"error": "miner_address query param is required"}), 400
@@ -823,6 +836,8 @@ def stake_here():
     roughly once per second in a background thread the same way a real
     wallet's staking loop would, rather than needing to be polled from
     outside."""
+    if not LOCAL_MINE_ENABLED:
+        return jsonify({"status": "failed", "reason": "/pos/stake is disabled on this node. Ongoing staking uses node.py --stake; set OCOIN_ENABLE_LOCAL_MINE=true only for local dev."}), 403
     address = request.args.get("address")
     if not address:
         return jsonify({"error": "address query param is required"}), 400

@@ -99,8 +99,19 @@ so keeping them gated costs participants nothing.
   still 401, and the rate limiter returns 429 past the cap. *Independent nodes
   can now fully participate — submit transactions, gossip blocks, peer — no
   secret.*
-- **D3 — Lock the DoS endpoints.** Ensure `/mine` and `/pos/stake` stay gated,
-  and add an env flag to disable `/mine` entirely in production.
+- **D3 — Lock the DoS endpoints. ✅ SHIPPED 2026-07-20.** `/mine` (in-process
+  PoW) and `/pos/stake` (manual stake attempt) now return 403 unless
+  `OCOIN_ENABLE_LOCAL_MINE=true` — OFF in production. Real mining/staking use
+  `/mining/*` + `--stake` and are unaffected. This retires the last thing the
+  shared secret meaningfully guarded on the node (after D1/D2 everything else
+  is public), so the node is safe even if the secret is unset. Verified on an
+  isolated node: flag off → 403 even with the secret; flag on → reachable and
+  still secret-gated.
+
+  Rate-limiter follow-up (D2): the first D2 deploy's limiter silently never
+  fired in production because `ProxyFix` keyed on Render's rotating edge IP;
+  fixed to key on the leftmost `X-Forwarded-For` (real client) and verified
+  live (429 past the cap).
 - **D4 — Retire the secret's peering role.** With reads + gossip public, the
   hosted nodes peer with strangers over public routes and no longer need the
   secret to sync. The secret now guards only the admin endpoints (D3). The
