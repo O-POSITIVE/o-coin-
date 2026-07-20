@@ -98,12 +98,38 @@ NODE_SHARED_SECRET = os.getenv("OCOIN_NODE_SHARED_SECRET")
 # full chain validation to be accepted, same as any other miner talking
 # to any other node on any real chain. Every other route (transactions,
 # pool payouts, peer/node management) stays behind the shared secret.
-PUBLIC_PATHS = {"/status", "/mining/template", "/mining/submit"}
+# Routes anyone can call WITHOUT the operator's shared secret. Keyed on the
+# Flask endpoint (view-function name), not the raw path, so parameterized
+# routes like /balance/<address> and /blocks/<idx> are covered by one entry.
+#
+# Decentralization rollout (see DECENTRALIZATION.md). The secret is an ACCESS
+# gate, not the consensus gate — every write path re-validates from scratch
+# (mining/submit already runs untrusted blocks through accept_block), so
+# reading public chain data needs no secret.
+#   Phase D1 (DONE): all READ routes + pool mining are public, so anyone can
+#     run a node that fully syncs from the live network and mine it.
+#   Phase D2 (pending): the gossip writes — new_transaction, receive_block,
+#     register_nodes, resolve_conflicts — become public behind rate limiting +
+#     a mempool cap, letting independent nodes fully peer.
+#   Still gated (D3): mine_here (/mine) and stake_here (/pos/stake) are
+#     CPU-DoS-prone operator conveniences that real mining/staking never need.
+PUBLIC_ENDPOINTS = {
+    # already public before the rollout
+    "status", "mining_template", "mining_submit",
+    # D1 — reads
+    "get_chain", "get_balance", "pending_transactions",
+    "pool_status", "pos_status", "stake_pool_status",
+    "list_pools", "amm_pool_status",
+    "blocks_page", "block_detail", "address_transactions",
+    "stake_pool_history", "amm_pool_history",
+    # D1 — pool mining (mirrors the already-public solo-mining endpoints)
+    "pool_template", "pool_submit_share",
+}
 
 
 @app.before_request
 def _require_shared_secret():
-    if not NODE_SHARED_SECRET or request.path in PUBLIC_PATHS:
+    if not NODE_SHARED_SECRET or request.endpoint in PUBLIC_ENDPOINTS:
         return None
     if request.headers.get("X-Node-Auth") != NODE_SHARED_SECRET:
         return jsonify({"status": "failed", "reason": "Unauthorized"}), 401
@@ -259,9 +285,24 @@ def status():
     })
 
 
+_chain_cache = {"key": None, "body": None}
+
 @app.route("/chain")
 def get_chain():
-    return jsonify({"length": len(blockchain.chain), "chain": [b.to_dict() for b in blockchain.chain]})
+    # Now a PUBLIC route (D1), so serialize the whole chain at most once per
+    # chain change instead of on every hit — otherwise repeated /chain calls
+    # would re-serialize hundreds of blocks each time, an easy amplification
+    # DoS. Keyed on (height, tip hash) so a reorg that keeps the same length
+    # still invalidates. Peer sync still receives the full chain unchanged.
+    with chain_lock:
+        n = len(blockchain.chain)
+        tip = blockchain.latest_block.compute_hash() if n else None
+        key = (n, tip)
+        if _chain_cache["key"] != key:
+            _chain_cache["key"] = key
+            _chain_cache["body"] = json.dumps({"length": n, "chain": [b.to_dict() for b in blockchain.chain]})
+        body = _chain_cache["body"]
+    return app.response_class(body, mimetype="application/json")
 
 
 @app.route("/balance/<address>")

@@ -70,10 +70,16 @@ so keeping them gated costs participants nothing.
 
 ## Phased rollout (each phase independently shippable + testable)
 
-- **D1 — Open the reads (zero consensus risk).** Add all read + pool-mining
-  routes to `PUBLIC_PATHS`; paginate `/chain`. Ship. *Now anyone can run a node
-  that fully SYNCS from the live network and mine.* This alone creates real
-  independent full nodes.
+- **D1 — Open the reads. ✅ SHIPPED 2026-07-20.** Gating switched from
+  exact-path to endpoint-based (`PUBLIC_ENDPOINTS`) so parameterized routes are
+  covered; all read routes + pool mining are now public; `/chain` got a
+  (height, tip-hash)-keyed response cache so opening it can't be an
+  amplification DoS (peer sync still gets the full chain). Verified on an
+  isolated secret-configured node: reads return 200 without the secret, while
+  `/nodes/resolve`, `/mine`, and `/transactions/new` still return 401. *Anyone
+  can now run a node that fully SYNCS from the live network and mine it.*
+  (Full `/chain` pagination for very large chains remains a later optimization;
+  the cache handles today's scale.)
 - **D2 — Open the gossip (add the guards first).** Add `flask-limiter` + the
   mempool cap, then make `/transactions/new`, `/blocks/receive`,
   `/nodes/resolve`, `/nodes/register` public. *Now independent nodes fully
