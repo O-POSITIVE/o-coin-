@@ -57,7 +57,6 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-from werkzeug.middleware.proxy_fix import ProxyFix
 
 from blockchain import Block, Blockchain
 from transaction import Transaction
@@ -69,18 +68,21 @@ from transaction import Transaction
 load_dotenv()
 
 app = Flask(__name__)
-# The node runs behind Render's reverse proxy, so the real client IP is in
-# X-Forwarded-For, not request.remote_addr (which would be the proxy — making
-# every caller share one address and defeating per-IP rate limits). ProxyFix
-# trusts one proxy hop and surfaces the real client IP.
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 # Per-IP rate limiting (decentralization phase D2) on the now-public gossip /
 # write routes only — reads and mining stay unthrottled (no default limit).
-# In-memory storage is correct here: each node is a single process. Limits are
-# generous (legitimate peers gossip ~1 block / 15s and users submit the odd
-# transaction) but cap the volume an anonymous flooder can push at the public
-# endpoints. Each block/tx is still independently re-validated regardless.
-limiter = Limiter(key_func=get_remote_address, app=app)
+# Behind Render's proxy the real client IP is the LEFTMOST entry of
+# X-Forwarded-For. request.remote_addr (and ProxyFix's rightmost pick) is a
+# ROTATING Render edge address, so keying on it makes every request look like a
+# fresh client and the per-IP counter never accumulates — that's why the first
+# D2 deploy's limiter silently never fired (13 hits at a 10/min cap, zero 429s
+# in production). Keying on XFF[0] fixes it; fall back to remote_addr for
+# direct/local calls with no proxy header. In-memory storage is correct: each
+# node is a single process.
+def _rate_limit_key():
+    xff = request.headers.get("X-Forwarded-For", "")
+    return xff.split(",")[0].strip() if xff else get_remote_address()
+
+limiter = Limiter(key_func=_rate_limit_key, app=app)
 chain_lock = threading.Lock()  # guards every mutation below — a node is a single shared blockchain instance, and mining/tx-submission/sync/gossip can all race against each other without this
 blockchain = Blockchain()
 peers = set()  # other nodes' base URLs, e.g. "http://localhost:5101" — registered by hand for now, see README's roadmap for real peer discovery
