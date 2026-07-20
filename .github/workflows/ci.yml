@@ -21,7 +21,7 @@ jobs:
 
       - name: Install core dependencies
         run: |
-          pip install flask ecdsa requests py_ecc psycopg2-binary python-dotenv truststore
+          pip install flask flask-limiter ecdsa requests py_ecc psycopg2-binary python-dotenv truststore
           # Native BLS is optional; bls_backend.py falls back to py_ecc. Don't
           # fail CI if the wheel isn't available for this runner's Python.
           pip install milagro-bls-binding || echo "native BLS unavailable — py_ecc fallback in effect"

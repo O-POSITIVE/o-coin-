@@ -88,10 +88,17 @@ so keeping them gated costs participants nothing.
   startup resolve is now wrapped so it can never be fatal (a node always has
   its own persisted chain). This is exactly why each phase deploys and gets
   verified in production before the next.
-- **D2 — Open the gossip (add the guards first).** Add `flask-limiter` + the
-  mempool cap, then make `/transactions/new`, `/blocks/receive`,
-  `/nodes/resolve`, `/nodes/register` public. *Now independent nodes fully
-  participate in propagation and mempool.*
+- **D2 — Open the gossip. ✅ SHIPPED 2026-07-20.** Guards first: added
+  `flask-limiter` (per-IP, in-memory; `ProxyFix` so the real client IP is used
+  behind Render's proxy) with `@limiter.limit` on each gossip route
+  (`/transactions/new` 30/min, `/blocks/receive` 120/min, `/nodes/register`
+  10/min, `/nodes/resolve` 6/min), plus a bounded mempool
+  (`Blockchain.MEMPOOL_MAX = 5000`, fee-priority eviction). Then moved the four
+  routes into `PUBLIC_ENDPOINTS`. Verified on an isolated node: gossip routes
+  reachable without the secret (400 on bad body, not 401), `/mine` + `/pos/stake`
+  still 401, and the rate limiter returns 429 past the cap. *Independent nodes
+  can now fully participate — submit transactions, gossip blocks, peer — no
+  secret.*
 - **D3 — Lock the DoS endpoints.** Ensure `/mine` and `/pos/stake` stay gated,
   and add an env flag to disable `/mine` entirely in production.
 - **D4 — Retire the secret's peering role.** With reads + gossip public, the

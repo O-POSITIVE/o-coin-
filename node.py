@@ -55,6 +55,9 @@ import psycopg2.extras
 import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from blockchain import Block, Blockchain
 from transaction import Transaction
@@ -66,6 +69,18 @@ from transaction import Transaction
 load_dotenv()
 
 app = Flask(__name__)
+# The node runs behind Render's reverse proxy, so the real client IP is in
+# X-Forwarded-For, not request.remote_addr (which would be the proxy — making
+# every caller share one address and defeating per-IP rate limits). ProxyFix
+# trusts one proxy hop and surfaces the real client IP.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+# Per-IP rate limiting (decentralization phase D2) on the now-public gossip /
+# write routes only — reads and mining stay unthrottled (no default limit).
+# In-memory storage is correct here: each node is a single process. Limits are
+# generous (legitimate peers gossip ~1 block / 15s and users submit the odd
+# transaction) but cap the volume an anonymous flooder can push at the public
+# endpoints. Each block/tx is still independently re-validated regardless.
+limiter = Limiter(key_func=get_remote_address, app=app)
 chain_lock = threading.Lock()  # guards every mutation below — a node is a single shared blockchain instance, and mining/tx-submission/sync/gossip can all race against each other without this
 blockchain = Blockchain()
 peers = set()  # other nodes' base URLs, e.g. "http://localhost:5101" — registered by hand for now, see README's roadmap for real peer discovery
@@ -108,9 +123,12 @@ NODE_SHARED_SECRET = os.getenv("OCOIN_NODE_SHARED_SECRET")
 # reading public chain data needs no secret.
 #   Phase D1 (DONE): all READ routes + pool mining are public, so anyone can
 #     run a node that fully syncs from the live network and mine it.
-#   Phase D2 (pending): the gossip writes — new_transaction, receive_block,
-#     register_nodes, resolve_conflicts — become public behind rate limiting +
-#     a mempool cap, letting independent nodes fully peer.
+#   Phase D2 (DONE): the gossip writes — new_transaction, receive_block,
+#     register_nodes, resolve_conflicts — are public behind per-IP rate
+#     limiting (see @limiter.limit on each) + a bounded mempool
+#     (Blockchain.MEMPOOL_MAX), letting independent nodes fully peer. Each is
+#     still fully re-validated (signature/fee/PoW), so the secret was never
+#     what protected them.
 #   Still gated (D3): mine_here (/mine) and stake_here (/pos/stake) are
 #     CPU-DoS-prone operator conveniences that real mining/staking never need.
 PUBLIC_ENDPOINTS = {
@@ -124,6 +142,8 @@ PUBLIC_ENDPOINTS = {
     "stake_pool_history", "amm_pool_history",
     # D1 — pool mining (mirrors the already-public solo-mining endpoints)
     "pool_template", "pool_submit_share",
+    # D2 — gossip/write, each rate-limited + fully re-validated
+    "new_transaction", "receive_block", "register_nodes", "resolve_conflicts",
 }
 
 
@@ -328,6 +348,7 @@ def pending_transactions():
 
 
 @app.route("/transactions/new", methods=["POST"])
+@limiter.limit("30 per minute")  # D2: public tx submission, per-IP flood cap
 def new_transaction():
     body = request.get_json(silent=True) or {}
     required = ("sender", "recipient", "amount", "public_key", "signature")
@@ -492,6 +513,7 @@ def pool_status():
 
 
 @app.route("/blocks/receive", methods=["POST"])
+@limiter.limit("120 per minute")  # D2: block gossip (~1/15s normally); each is re-validated
 def receive_block():
     """A peer pushed us a freshly-mined OR freshly-staked block (see
     broadcast_block). If it cleanly extends our current tip, accept it
@@ -525,6 +547,7 @@ def receive_block():
 
 # ── Peer sync — the actual "network" half of "blockchain network" ──────────
 @app.route("/nodes/register", methods=["POST"])
+@limiter.limit("10 per minute")  # D2: peer registration is rare; tight cap curbs sybil flooding
 def register_nodes():
     body = request.get_json(silent=True) or {}
     urls = body.get("nodes", [])
@@ -581,6 +604,7 @@ def _resolve_with_peers():
 
 
 @app.route("/nodes/resolve")
+@limiter.limit("6 per minute")  # D2: expensive (fetches every peer's full chain); tight cap
 def resolve_conflicts():
     replaced = _resolve_with_peers()
     return jsonify({"status": "ok", "replaced": replaced, "chain_length": len(blockchain.chain)})

@@ -1,4 +1,5 @@
 flask
+flask-limiter
 ecdsa
 requests
 py_ecc

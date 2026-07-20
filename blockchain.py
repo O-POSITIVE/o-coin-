@@ -174,6 +174,13 @@ class Blockchain:
     TARGET_BLOCK_TIME = 15  # seconds — short and Dogecoin-fast on purpose, not Bitcoin-slow
     RETARGET_INTERVAL = 10  # re-check every 10 blocks
     MAX_ADJUSTMENT_FACTOR = 4  # difficulty can at most 4x or /4 in one retarget, same anti-whiplash cap Speepcoin's contract uses
+    # Once /transactions/new is a PUBLIC route (decentralization phase D2),
+    # the mempool must be bounded so anyone can't grow it without limit. When
+    # full, a new transaction only displaces the current lowest-fee pending one
+    # if it pays a strictly higher fee — the same fee-priority the block builder
+    # already uses to choose what to include. ~25 min of backlog at the ~50-tx,
+    # 15s block cadence, so it never bites legitimate use.
+    MEMPOOL_MAX = 5000
 
     # ── Emission curve — smooth EXPONENTIAL decay toward a permanent
     # floor, not Bitcoin/Dogecoin-style discrete halving and not a
@@ -1039,6 +1046,15 @@ class Blockchain:
                 if preview_balances.get(key, 0) < 0:
                     addr, asset = key
                     raise ValueError(f"Insufficient {asset} balance: {addr} would go to {preview_balances[key]}")
+        # Bounded mempool (see MEMPOOL_MAX): when full, only accept a new tx if
+        # it outbids the cheapest pending one, then evict that cheapest. Keeps
+        # the now-public submission endpoint from being an unbounded-growth DoS
+        # while preserving fee priority.
+        if len(self.mempool) >= self.MEMPOOL_MAX:
+            cheapest = min(self.mempool, key=lambda t: t.fee)
+            if tx.fee <= cheapest.fee:
+                raise ValueError(f"Mempool is full ({self.MEMPOOL_MAX} pending); fee {tx.fee} does not beat the lowest pending fee {cheapest.fee}")
+            self.mempool.remove(cheapest)
         self.mempool.append(tx)
         return tx.hash()
 
