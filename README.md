@@ -39,6 +39,37 @@ curl -X POST http://localhost:5100/nodes/register -H "Content-Type: application/
 curl -X POST http://localhost:5101/nodes/register -H "Content-Type: application/json" -d "{\"nodes\": [\"http://localhost:5100\"]}"
 ```
 
+## Run your own node / join the live network
+
+O-Coin is MIT-licensed and meant to be run by more than its author. Two ways
+to take part:
+
+**Mine the live network today — no permission, no secret.** The network's
+mining endpoints (`/status`, `/mining/template`, `/mining/submit`) are public,
+so anyone can point a miner at the hosted node and contribute real
+proof-of-work for real OCN, exactly like mining any open PoW chain:
+
+```
+python wallet.py                      # make a wallet; note the address
+python miner.py --node https://o-coin.onrender.com --address <your address>
+```
+
+**Run a full node of your own.** `python node.py` is a complete, independent
+node — it validates, stores, mines, stakes, and peers just like the hosted
+ones. Point two at each other (see Quick start above) and you have your own
+network, with zero code changes needed for anyone else's node to join it.
+
+**Honest limitation — help wanted.** Fully *peering* with the LIVE network
+(pulling its chain and exchanging blocks over the sync routes) currently
+requires the operator's shared secret, because every route except the three
+public mining ones is gated. That is the real centralization point right now:
+the two hosted nodes are operator-run, so a stranger can *mine* the live chain
+but cannot yet permissionlessly *sync* as an independent peer. Opening the
+read + peer-sync endpoints — while keeping only genuinely sensitive operations
+gated — is the next concrete step toward a real multi-operator network, and is
+exactly the kind of contribution this project is looking for. (Background:
+the sibling `trading-platform` repo's `docs/13`, finding F5.)
+
 ## Architecture
 
 | File | Role |
