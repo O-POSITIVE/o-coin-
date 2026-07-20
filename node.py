@@ -781,6 +781,84 @@ def staking_loop(address):
             broadcast_block(block)
 
 
+def keeper_loop(address):
+    """Chain-liveness keeper — a deliberately gentle, in-process PoW miner
+    that only works when the chain actually needs a block. Exists because
+    the chain has stalled in practice whenever the operator's external
+    miner (miner.py on a home machine) wasn't running: pending transactions
+    sat in the mempool indefinitely and every wallet/pool action appeared
+    frozen (2026-07-19, twice, including during the premine burn).
+
+    Inert unless OCOIN_KEEPER_ADDRESS is set (same opt-in pattern as
+    --stake). Mines only when:
+      - the mempool is non-empty and the tip is older than
+        OCOIN_KEEPER_TX_WAIT_SECONDS (default 20) — i.e. a real transaction
+        is waiting and no faster external miner has picked it up; or
+      - the tip is older than OCOIN_KEEPER_HEARTBEAT_SECONDS (default 600)
+        — a slow heartbeat so difficulty retargets toward this node's own
+        modest hash rate instead of staying stranded at whatever a much
+        faster external miner left it at (which would otherwise make the
+        FIRST keeper block after that miner stops take hours).
+
+    The search runs OUTSIDE chain_lock in small batches with sleeps in
+    between, so HTTP responsiveness on a small cloud instance is preserved
+    and an external miner submitting first simply wins the block — the
+    keeper notices the tip moved and abandons its stale candidate. Rewards
+    go to OCOIN_KEEPER_ADDRESS; pointing that at the faucet's address turns
+    keeper rewards into community faucet funding rather than operator
+    accumulation (fair-launch posture, see BURN.md).
+    """
+    from pow_hash import header_fields_to_hash
+    tx_wait = max(5, int(os.getenv("OCOIN_KEEPER_TX_WAIT_SECONDS", "20")))
+    heartbeat = max(30, int(os.getenv("OCOIN_KEEPER_HEARTBEAT_SECONDS", "600")))
+    batch = 120          # nonces per burst — small on purpose (Scrypt is slow)
+    pause = 0.15         # sleep between bursts: keeps CPU mostly idle
+    print(f"Keeper loop started — rewards to {address}, tx-wait {tx_wait}s, heartbeat {heartbeat}s")
+    while True:
+        time.sleep(5)
+        try:
+            with chain_lock:
+                tip_age = time.time() - blockchain.latest_block.timestamp
+                mempool_size = len(blockchain.mempool)
+            if not (mempool_size and tip_age > tx_wait) and tip_age < heartbeat:
+                continue
+            with chain_lock:
+                candidate = blockchain.build_candidate_block(address)
+            target = int(candidate.target)
+            nonce, last_tip_check = 0, time.time()
+            while True:
+                for _ in range(batch):
+                    digest = header_fields_to_hash(candidate.index, candidate.timestamp,
+                                                   candidate.merkle_root, candidate.previous_hash,
+                                                   candidate.target, nonce)
+                    if int(digest, 16) < target:
+                        candidate.nonce = nonce
+                        with chain_lock:
+                            blockchain.accept_block(candidate)
+                            save_block(candidate)
+                        broadcast_block(candidate)
+                        print(f"Keeper mined block #{candidate.index} ({mempool_size} tx(s) were pending)")
+                        nonce = None
+                        break
+                    nonce += 1
+                if nonce is None:
+                    break
+                time.sleep(pause)
+                # Abandon a stale candidate: someone else (external miner or a
+                # peer) already produced this block while we were searching.
+                if time.time() - last_tip_check > 5:
+                    with chain_lock:
+                        if blockchain.latest_block.compute_hash() != candidate.previous_hash:
+                            break
+                    last_tip_check = time.time()
+        except ValueError as e:
+            # accept_block rejecting our own candidate (tip moved between the
+            # final search burst and the lock) is normal contention, not a fault.
+            print(f"keeper: candidate rejected ({e}) — retrying on the new tip")
+        except Exception as e:
+            print(f"keeper tick failed: {e}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=5100)
@@ -831,4 +909,7 @@ if __name__ == "__main__":
     print(f"O-Coin node starting on {args.host}:{args.port} — target block time {blockchain.TARGET_BLOCK_TIME}s, {len(blockchain.chain)} block(s) loaded, persisting to Postgres table {BLOCKS_TABLE}")
     if args.stake:
         threading.Thread(target=staking_loop, args=(args.stake,), daemon=True).start()
+    keeper_address = (os.getenv("OCOIN_KEEPER_ADDRESS") or "").strip()
+    if keeper_address:
+        threading.Thread(target=keeper_loop, args=(keeper_address,), daemon=True).start()
     app.run(host=args.host, port=args.port)
