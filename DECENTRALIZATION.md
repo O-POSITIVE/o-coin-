@@ -1,10 +1,19 @@
 # Decentralization: opening the network to independent nodes
 
-**Status: SCOPED, not yet implemented.** This is the plan to close the one
-real gap between "a chain one person operates" and "a chain anyone can run a
-node on." It ties to the trading-platform repo's `docs/13` finding F5, and to
-the fair-launch posture in `BURN.md`: the premine burn bought *"no founder
-premine"*; this work buys *"not reversible or controllable by one person."*
+**Status: D1–D4 SHIPPED AND LIVE (2026-07-20). D5 (docs) done — see the
+README's "Run your own node" section for the actual join instructions.** This
+closed the real gap between "a chain one person operates" and "a chain anyone
+can run a node on." It ties to the trading-platform repo's `docs/13` finding
+F5, and to the fair-launch posture in `BURN.md`: the premine burn bought *"no
+founder premine"*; this work buys *"not reversible or controllable by one
+person."*
+
+**The permissionless network is real, today:** any node running `python
+node.py` with `OCOIN_PEERS` set to the two hosted URLs below fully syncs the
+live chain, submits transactions, gossips blocks, and mines — with no secret.
+What remains beyond this document is a social/adoption problem (getting
+independent operators to actually run nodes and contribute real hash power),
+not a code or access problem.
 
 ## The blocker, precisely
 
@@ -118,10 +127,11 @@ so keeping them gated costs participants nothing.
   trading-platform server keeps sending its `X-Node-Auth` header harmlessly
   (public routes ignore it) — **no change required there**, and it can be
   cleaned up later.
-- **D5 — Bootstrap docs + published seeds.** Publish the hosted node URLs as
-  seed peers, and document the real join flow (`python node.py` +
-  `OCOIN_PEERS=https://o-coin.onrender.com,...`). Update the README's
-  "run your own node" section from "help wanted" to "here's how."
+- **D5 — Bootstrap docs + published seeds. ✅ SHIPPED.** README's "Run your
+  own node" section rewritten from "help wanted" to a real how-to: both hosted
+  node URLs published as seed peers
+  (`OCOIN_PEERS=https://o-coin.onrender.com,https://o-coin-backup.onrender.com`),
+  plus the actual sync/mine/submit commands.
 
 ## Acceptance test (the proof it worked)
 
