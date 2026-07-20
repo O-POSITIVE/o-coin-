@@ -50,3 +50,6 @@ archive/
 
 # One-off local secret-rotation helper (hardcodes local paths).
 rotate_secret.py
+
+# Personal control-center launcher.
+O-Coin Control Center.bat

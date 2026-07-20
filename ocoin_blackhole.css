@@ -1,0 +1,8 @@
+/* A deliberately visible version of the NEXUS event horizon. CSS glass lets
+   it show through without sacrificing text contrast. */
+#nexus-blackhole{position:fixed;inset:0;z-index:0;pointer-events:none}
+header,nav,main,.toast{position:relative;z-index:1}
+header{background:linear-gradient(90deg,rgba(2,5,15,.64),rgba(2,5,15,.03))!important}
+.card{background:linear-gradient(135deg,rgba(12,30,58,.34),rgba(3,9,24,.13))!important;backdrop-filter:blur(10px) saturate(155%)!important;border-color:rgba(120,220,255,.29)!important;box-shadow:0 24px 80px rgba(0,0,0,.32),inset 0 1px rgba(255,255,255,.15),0 0 42px rgba(50,112,255,.08)!important}
+.card:before{opacity:.58!important}
+input,.console{background:rgba(0,5,17,.50)!important}
