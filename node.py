@@ -554,12 +554,27 @@ def _resolve_with_peers():
                 # /nodes/resolve, and peer_sync_loop's already-throttled
                 # once-per-2-min check — never in a request hot path.
                 resp = requests.get(f"{peer}/chain", headers=headers, timeout=60)
+                # A peer that returns anything other than a real chain payload
+                # (a 401 from a secret mismatch, a 5xx, a cold-start HTML page,
+                # malformed JSON) must be SKIPPED, never fatal. Previously
+                # `data["chain"]` on a `{"reason":"Unauthorized"}` body raised
+                # KeyError straight out of the startup call in __main__ and
+                # crashed the whole node on boot — exactly the kind of thing
+                # that turns one peer being briefly down or out-of-sync into a
+                # total outage. A node always has its own persisted chain to
+                # fall back on, so skipping a bad peer is safe.
+                if resp.status_code != 200:
+                    print(f"Peer {peer} returned {resp.status_code} for /chain; skipping")
+                    continue
                 data = resp.json()
+                if not isinstance(data, dict) or "chain" not in data:
+                    print(f"Peer {peer} /chain response has no chain; skipping")
+                    continue
                 candidate = [Block.from_dict(b) for b in data["chain"]]
                 if blockchain.replace_chain(candidate):
                     replaced = True
-            except requests.RequestException as e:
-                print(f"Could not reach peer {peer}: {e}")
+            except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+                print(f"Could not sync from peer {peer}: {e}")
         if replaced:
             save_full_chain()
     return replaced
