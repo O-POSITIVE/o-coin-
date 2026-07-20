@@ -1,0 +1,40 @@
+name: CI
+
+# Pre-push seatbelt for the O-Coin chain. Consensus/chain bugs found in
+# production are not a one-line rollback (real value is on the chain), so this
+# runs the fast, in-memory chain/pool test suites plus a full syntax compile on
+# every push. See the trading-platform docs/13 (F4) for the wider rationale.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install core dependencies
+        run: |
+          pip install flask ecdsa requests py_ecc psycopg2-binary python-dotenv truststore
+          # Native BLS is optional; bls_backend.py falls back to py_ecc. Don't
+          # fail CI if the wheel isn't available for this runner's Python.
+          pip install milagro-bls-binding || echo "native BLS unavailable — py_ecc fallback in effect"
+
+      # Compiles every top-level module (chain, node, all BFT files) to catch
+      # syntax errors without needing a database.
+      - name: Syntax-compile all top-level Python
+        run: python -m compileall -q *.py
+
+      # The fast, self-contained suites — pure in-memory Blockchain, no DB and
+      # no HTTP node. (test_balance_index / test_multiasset need Postgres and
+      # test_live_network needs a running node, so they run locally, not in CI.
+      # The BFT suites are excluded from CI v1 because the py_ecc fallback makes
+      # them minutes-slow; compileall still guards their syntax.)
+      - name: In-memory chain/pool test suites
+        run: python -m unittest test_amm_pools test_stake_pool test_pool_history
