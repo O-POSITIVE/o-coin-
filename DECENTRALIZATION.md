@@ -133,6 +133,33 @@ so keeping them gated costs participants nothing.
   (`OCOIN_PEERS=https://o-coin.onrender.com,https://o-coin-backup.onrender.com`),
   plus the actual sync/mine/submit commands.
 
+## Capstone verification — a real stranger, not a simulation (2026-07-20)
+
+Ran the acceptance test for real against the live network, not an isolated
+sandbox: started a brand-new `node.py` process with **`OCOIN_NODE_SHARED_SECRET`
+entirely unset** (a true stranger — no relationship to the operator) and a
+**fresh, empty database table** (zero prior chain state), pointed at
+`https://o-coin.onrender.com` as its only peer.
+
+Results:
+- **Synced the real chain from scratch**: adopted all 1,300 real blocks on
+  startup via the public `/chain`, tip hash matching the live network within
+  the normal real-time lag (it advanced to 1,301 while the test ran).
+- **Write paths reachable with no secret, and correctly validated (not just
+  "not 401")**: `/transactions/new` with a malformed signature → `400`, a real
+  validation rejection, not a mempool entry. `/blocks/receive` with a
+  fabricated block → `200` with `replaced: false` — `accept_block` rejected it,
+  the node fell through to its designed `_resolve_with_peers` reconciliation
+  against its REAL peers, and correctly found nothing to adopt. The chain was
+  provably untouched by the bogus payload.
+- **`/nodes/resolve`** reachable with no secret, `200`.
+- **D3 still holds**: `/mine` and `/pos/stake` both `401` with no secret.
+- **Live chain unaffected**: height sane and advancing after the probes.
+
+This is the real proof, not a stand-in for it: an outside participant with
+zero prior relationship to the operator can join, fully sync, and interact
+with the live network today.
+
 ## Acceptance test (the proof it worked)
 
 An isolated two-node test where **node B has NO shared secret** and must, over
